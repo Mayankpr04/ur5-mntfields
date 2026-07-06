@@ -1,0 +1,115 @@
+robot_cfg:
+  dynamics:
+    payload_joint: wrist_3_joint
+    payload_mass_range: [0.0, 3.0]
+  kinematics:
+    asset_root_path: /home/mayank/ur_ws/src
+    base_link: base_link
+    collision_link_names:
+      - shoulder_link
+      - upper_arm_link
+      - forearm_link
+      - wrist_1_link
+      - wrist_2_link
+      - wrist_3_link
+      - tool0
+      - camera_link
+    collision_sphere_buffer: 0.0
+    collision_spheres:
+      shoulder_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.06
+      upper_arm_link:
+        - center: [0.0, 0.0, 0.11]
+          radius: 0.07
+        - center: [-0.10625, 0.0, 0.11]
+          radius: 0.055
+        - center: [-0.2125, 0.0, 0.11]
+          radius: 0.055
+        - center: [-0.31875, 0.0, 0.11]
+          radius: 0.055
+        - center: [-0.425, 0.0, 0.11]
+          radius: 0.06
+      forearm_link:
+        - center: [0.0, 0.0, 0.026]
+          radius: 0.05
+        - center: [-0.098, 0.0, 0.026]
+          radius: 0.045
+        - center: [-0.196, 0.0, 0.026]
+          radius: 0.045
+        - center: [-0.294, 0.0, 0.026]
+          radius: 0.045
+        - center: [-0.39225, 0.0, 0.026]
+          radius: 0.05
+      wrist_1_link:
+        - center: [0.0, -0.02, 0.0]
+          radius: 0.045
+      wrist_2_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.045
+      wrist_3_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.04
+        - center: [0.0, 0.0, 0.05]
+          radius: 0.045
+      tool0:
+        - center: [0.0, 0.0, 0.06]
+          radius: 0.03
+      camera_link:
+        - center: [0.0, 0.0, 0.0]
+          radius: 0.03
+    cspace:
+      joint_names:
+        - shoulder_pan_joint
+        - shoulder_lift_joint
+        - elbow_joint
+        - wrist_1_joint
+        - wrist_2_joint
+        - wrist_3_joint
+      cspace_distance_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      null_space_weight: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+      max_acceleration: 12.0
+      max_jerk: 500.0
+      position_limit_clip: 0.1
+      default_joint_position: [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
+    tool_frames:
+      - camera_link
+    lock_joints: null
+    mesh_link_names:
+      - shoulder_link
+      - upper_arm_link
+      - forearm_link
+      - wrist_1_link
+      - wrist_2_link
+      - wrist_3_link
+      - camera_link
+    self_collision_buffer:
+      shoulder_link: 0.05
+      upper_arm_link: 0.0
+      forearm_link: 0.0
+      wrist_1_link: 0.0
+      wrist_2_link: 0.0
+      wrist_3_link: 0.0
+      tool0: 0.0
+      camera_link: 0.0
+    self_collision_ignore:
+      upper_arm_link:
+        - shoulder_link
+        - forearm_link
+      forearm_link:
+        - wrist_1_link
+      wrist_1_link:
+        - wrist_2_link
+        - wrist_3_link
+      wrist_2_link:
+        - wrist_3_link
+        - tool0
+      wrist_3_link:
+        - tool0
+        - camera_link
+      tool0:
+        - camera_link
+      camera_link:
+        - tool0
+        - wrist_3_link
+    urdf_path: /home/mayank/ur_ws/curobo_configs/ur5_wrist_camera.urdf

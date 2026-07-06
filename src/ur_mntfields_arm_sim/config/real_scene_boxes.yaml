@@ -1,0 +1,14 @@
+scene_boxes_publisher:
+  ros__parameters:
+    scene_boxes_topic: /scene_boxes
+    scene_boxes_frame: base_link
+    publish_hz: 1.0
+
+    # Edit this once after measuring/choosing the real ROI.
+    # Format: center_x, center_y, center_z, size_x, size_y, size_z in scene_boxes_frame.
+    # Multiple boxes are allowed; the explorer uses their union for ROI and
+    # all boxes as known obstacles for distance/clearance.
+    scene_boxes:
+      - ""
+      # Example:
+      # - "0.70,0.00,0.60,0.50,0.80,0.80"

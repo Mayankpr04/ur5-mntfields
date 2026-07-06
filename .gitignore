@@ -1,0 +1,57 @@
+# Colcon/build products
+build/
+install/
+log/
+
+# Python cache/test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Generated training/evaluation outputs
+src/ur5_sim_training*/
+src/mntfields_rgbd_model/
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.pcd
+*.bag
+*.db3
+
+# Local notes, papers, screenshots, and scratch scripts
+*.pdf
+*.png
+commands.txt
+sim_files.txt
+sim_use.txt
+summary.md
+UR5_connection.txt
+NTFIELDS_ARM_TRAINING_NOTE.md
+field_viz.py
+forwardk_viz.py
+ik_viz.py
+inverse_kinematics.py
+path_vis.py
+test_samples.py
+ur5_pose_checker.py
+view_pcds.py
+visualize_training_artifacts.py
+
+# External/reference repositories kept in the workspace
+antfields-demo/
+ntrl-demo/
+mntfields_tb/
+src/Universal_Robots_Client_Library/
+src/Universal_Robots_ROS2_Description/
+src/Universal_Robots_ROS2_Driver/
+src/ur_msgs/
+src/log/
+src/callmap.html
+src/ur_mntfields_arm_sim/launch/callmap.html
+sensing/
+
+# ROS/Gazebo local runtime data
+.ros/
+*.log

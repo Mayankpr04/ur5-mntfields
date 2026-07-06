@@ -1,0 +1,30 @@
+rgbd_mntfields_sampler:
+  ros__parameters:
+    color_topic: /camera/camera/color/image_raw
+    depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /camera/camera/aligned_depth_to_color/camera_info
+    base_frame: camera_link
+    camera_frame: camera_color_optical_frame
+    output_dir: /home/mayank/ur_ws/src/mntfields_rgbd_output
+    save_color: true
+    save_depth_npy: true
+    save_depth_png: false
+    save_pointcloud_debug: false
+    depth_scale: 0.001
+    min_depth: 0.15
+    max_depth: 2.5
+    n_rays: 5000
+    n_strat_samples: 8
+    dist_behind_surf: 0.4
+    sample_min: 0.07
+    sample_max: 0.3
+    num_pairs: 10000
+    scale_factor: 1.0
+    bound_padding_xy: 0.05
+    bound_padding_z: 0.05
+    sync_slop_sec: 0.05
+    queue_size: 10
+    capture_stride: 1
+    min_translation_m: 0.0
+    min_rotation_deg: 0.0
+    random_seed: 0

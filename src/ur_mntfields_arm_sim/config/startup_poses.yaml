@@ -1,0 +1,14 @@
+trajectory_executor:
+  ros__parameters:
+    startup_timer_period_s: 1.0
+    home_delay_s: 2.0
+    inspection_delay_s: 8.0
+    pose_reached_tolerance_rad: 0.15
+    enable_startup_home: true
+    enable_startup_inspection: true
+    enable_startup_wiggle: true
+    startup_wiggle_delay_s: 15.0
+    startup_wiggle_delta: [0.0, 0.0, 0.0, 0.0, 0.25, 0.35]
+    home_positions: [0.0, -1.57, 0.0, -1.57, 0.0, 0.0]
+    inspection_positions: [0.0, -2.74850, 1.50004, -1.71994, -1.57000, 0.03334]
+#0.0, -1.35

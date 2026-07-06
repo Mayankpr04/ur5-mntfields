@@ -1,0 +1,221 @@
+synthetic_depth_camera:
+  ros__parameters:
+    base_frame: world
+    camera_frame: camera_color_optical_frame
+    depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+    camera_info_topic: /camera/camera/aligned_depth_to_color/camera_info
+    marker_topic: /ur_mntfields_arm_sim/cabinet_markers
+    width: 424
+    height: 240
+    fx: 212.0
+    fy: 212.0
+    cx: 212.0
+    cy: 120.0
+    min_depth_m: 0.20
+    max_depth_m: 2.00
+    noise_std_m: 0.002
+    publish_hz: 2.0
+    scene_boxes:
+      - "0.98,0.35,0.90,0.04,1.40,1.80"
+      - "0.84,-0.33,0.90,0.28,0.04,1.80"
+      - "0.84,1.03,0.90,0.28,0.04,1.80"
+      - "0.84,0.35,1.78,0.28,1.40,0.04"
+      - "0.84,0.35,0.02,0.28,1.40,0.04"
+      - "0.84,0.35,0.46,0.24,1.32,0.02"
+      - "0.84,0.35,0.90,0.24,1.32,0.02"
+      - "0.84,0.35,1.34,0.24,1.32,0.02"
+cabinet_marker_publisher:
+  ros__parameters:
+    base_frame: world
+    marker_topic: /ur_mntfields_arm_sim/cabinet_markers
+    scene_boxes:
+      - "0.98,0.35,0.90,0.04,1.40,1.80"
+      - "0.84,-0.33,0.90,0.28,0.04,1.80"
+      - "0.84,1.03,0.90,0.28,0.04,1.80"
+      - "0.84,0.35,1.78,0.28,1.40,0.04"
+      - "0.84,0.35,0.02,0.28,1.40,0.04"
+      - "0.84,0.35,0.46,0.24,1.32,0.02"
+      - "0.84,0.35,0.90,0.24,1.32,0.02"
+      - "0.84,0.35,1.34,0.24,1.32,0.02"
+    pedestal_boxes:
+      - "0.15,0.35,0.25,0.55,0.55,0.50"
+test_trained_field:
+  ros__parameters:
+    enable_robot_self_filter: true
+    robot_self_filter_padding_m: 0.04
+    robot_self_filter_tool_radius_m: 0.08
+    robot_self_filter_mount_radius_m: 0.07
+    clearance_backend: original
+    sdf_voxel_size_m: 0.04
+    sdf_padding_m: 0.75
+    sdf_max_cells: 4000000
+    scene_boxes_frame: world
+    scene_boxes:
+      - "0.98,0.35,0.90,0.04,1.40,1.80"
+      - "0.84,-0.33,0.90,0.28,0.04,1.80"
+      - "0.84,1.03,0.90,0.28,0.04,1.80"
+      - "0.84,0.35,1.78,0.28,1.40,0.04"
+      - "0.84,0.35,0.02,0.28,1.40,0.04"
+      - "0.84,0.35,0.46,0.24,1.32,0.02"
+      - "0.84,0.35,0.90,0.24,1.32,0.02"
+      - "0.84,0.35,1.34,0.24,1.32,0.02"
+arm_mntfields_explorer:
+  ros__parameters:
+    depth_topic: /camera/camera/aligned_depth_to_color/image_raw
+    color_topic: /camera/camera/color/image_raw
+    camera_info_topic: /camera/camera/aligned_depth_to_color/camera_info
+    fallback_camera_width: 424
+    fallback_camera_height: 240
+    fallback_fx: 212.0
+    fallback_fy: 212.0
+    fallback_cx: 212.0
+    fallback_cy: 120.0
+    joint_state_topic: /joint_states
+    base_frame: base_link
+    camera_frame: camera_color_optical_frame
+    tool_frame: tool0
+    visualization_frame: world
+    ur_type: ur5
+    output_dir: /home/mayank/ur_ws/src/ur5_sim_training_urdf_fk
+    camera_in_tool: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.10, 0.0, 0.0, 0.0, 1.0]
+    voxel_size_m: 0.05
+    frontier_match_radius_m: 0.18
+    frontier_visit_radius_m: 0.20
+    max_frontier_failures: 4
+    raycast_stride_px: 8
+    depth_min_m: 0.20
+    depth_max_m: 2.00
+    enable_robot_self_filter: true
+    robot_self_filter_padding_m: 0.04
+    robot_self_filter_tool_radius_m: 0.08
+    robot_self_filter_mount_radius_m: 0.07
+    clearance_backend: original
+    sdf_voxel_size_m: 0.04
+    sdf_padding_m: 0.75
+    sdf_max_cells: 4000000
+    sample_pairs_per_step: 7000
+    samples_per_ik_seed: 32
+    sampling_mode: joint_local_6d
+    sampling_proposal_batch_size: 512
+    clearance_margin_m: 0.15
+    clearance_offset_m: 0.0
+    clearance_label_floor: 0.0
+    clearance_label_power: 1.0
+    anchor_seed_probability: 0.35
+    use_field_eval_anchors_for_sampling: false
+    train_epochs_per_step: 180
+    train_every_n_frames: 1
+    replay_buffer_capacity: 100000
+    train_minibatch_size: 7000
+    train_replay_ratio: 0.75
+    replay_recombine_pairs_per_step: 7000
+    adaptive_training_enabled: true
+    field_ready_sample_pairs_per_step: 7000
+    field_ready_train_epochs_per_step: 180
+    field_ready_train_every_n_frames: 1
+    field_ready_replay_recombine_pairs_per_step: 7000
+    field_ready_hard_failed_pairs_per_step: 128
+    path_centered_pair_fraction: 0.10
+    near_boundary_pair_fraction: 0.35
+    path_anchor_stride: 4
+    path_anchor_buffer_limit: 7000
+    hard_failed_pairs_per_step: 128
+    hard_failed_anchor_buffer_limit: 7000
+    hard_failed_clearance_window_m: 0.08
+    step_size_q: 0.03
+    rollout_max_steps: 120
+    execution_planner: field
+    collision_aware_field_rollout: true
+    field_local_rollout_candidates: 32
+    rrt_max_iters: 4000
+    rrt_goal_bias: 0.20
+    enable_trajectory_publish: true
+    trajectory_topic: /ur_mntfields_arm/joint_trajectory
+    save_every_n_steps: 1
+    checkpoint_every_epochs: 120
+    enable_field_diagnostics: false
+    field_diagnostics_max_rows: 7000
+    field_diagnostics_grid_size: 61
+    field_td_loss_weight: 0.001
+    field_speed_loss_weight: 0.01
+    field_direct_speed_loss_weight: 0.0
+    field_normal_loss_weight: 0.001
+    field_normal_cos_loss_weight: 0.0
+    field_near_obstacle_loss_weight: 0.0
+    field_low_speed_threshold: 0.20
+    field_low_speed_pred_max: 0.30
+    field_low_speed_penalty_weight: 0.0
+    field_effective_speed_floor: 0.04
+    field_diag_gate_enabled: true
+    field_diag_gate_min_replay_pairs: 12000
+    field_diag_max_low_overpred_frac: 0.45
+    field_diag_min_speed_corr: 0.35
+    field_diag_min_near_far_gap: 0.20
+    field_diag_min_normal_cos_near: 0.20
+    debug_point_cloud_topic: /debug/points/world
+    planned_path_topic: /ur_mntfields_arm/planned_path
+    replan_while_executing: false
+    trajectory_busy_margin_s: 0.25
+    trajectory_max_joint_speed: 0.15
+    trajectory_min_segment_dt: 0.55
+    trajectory_waypoint_stride: 3
+    trajectory_smoothing_window: 5
+    execute_prefix_waypoints: 40
+    execute_prefix_min_duration_s: 8.0
+    enable_frontier_roi_filter: true
+    enable_object_roi_nbv: true
+    object_roi_nbv_first: true
+    rank_frontiers_when_roi_available: false
+    fast_roi_nbv: true
+    roi_nbv_max_pose_candidates: 18
+    enable_view_self_occlusion_filter: true
+    min_view_self_occlusion_free_fraction: 0.80
+    view_self_occlusion_padding_m: 0.03
+    min_frontier_visibility_score: 0.0
+    min_roi_coverage_ratio: 0.0
+    min_view_alignment: 0.60
+    frontier_roi_init_min_points: 300
+    frontier_roi_init_min_step: 1
+    frontier_roi_padding_xyz: [0.12, 0.12, 0.12]
+    scene_boxes:
+      - "0.98,0.35,0.90,0.04,1.40,1.80"
+      - "0.84,-0.33,0.90,0.28,0.04,1.80"
+      - "0.84,1.03,0.90,0.28,0.04,1.80"
+      - "0.84,0.35,1.78,0.28,1.40,0.04"
+      - "0.84,0.35,0.02,0.28,1.40,0.04"
+      - "0.84,0.35,0.46,0.24,1.32,0.02"
+      - "0.84,0.35,0.90,0.24,1.32,0.02"
+      - "0.84,0.35,1.34,0.24,1.32,0.02"
+    scene_boxes_frame: world
+    cabinet_bbox_padding_xyz: [0.04, 0.04, 0.04]
+    roi_clip_frame: world
+    roi_clip_min_xyz: [-10.0, -10.0, 0.55]
+    roi_clip_max_xyz: [10.0, 10.0, 10.0]
+    finish_when_frontiers_exhausted: true
+    finish_when_roi_covered: true
+    finish_when_field_eval_passes: false
+    roi_coverage_threshold: 0.82
+    roi_unknown_stop_voxels: 40
+    field_eval_points_frame: world
+    field_eval_points_xyz: [0.60, 0.35, 0.68, 0.60, 0.35, 1.12, 0.78, 0.35, 0.68, 0.78, 0.35, 1.12]
+    field_eval_goal_clearance_min_m: 0.05
+    field_eval_goal_tool_forward_alignment_min: 0.70
+    field_eval_success_ratio_threshold: 1.0
+    field_eval_every_n_steps: 1
+    field_eval_min_train_steps: 1000
+    field_eval_min_replay_pairs: 12000
+    field_eval_use_startup_pose: true
+    goal_tool_orientation_yaw_offsets_rad: [0.0, 1.5708, -1.5708, 3.1416]
+    goal_tool_orientation_pitch_offsets_rad: [0.0, 0.7854, -0.7854, 1.5708, -1.5708]
+    goal_tool_orientation_roll_offsets_rad: [0.0, 1.5708, -1.5708, 3.1416]
+    frontier_completion_patience_steps: 10
+    frontier_reselect_cooldown_steps: 12
+    viewpoint_cooldown_steps: 12
+    viewpoint_cooldown_radius_m: 0.18
+    enable_startup_pose_gate: true
+    inspection_positions: [0.0, -2.74850, 1.50004, -1.71994, -1.57000, 0.03334]
+    pose_reached_tolerance_rad: 0.04
+    startup_wait_log_interval_s: 2.0
+    startup_data_collection_delay_s: 6.0
+    strict_train_move_cycle: false
+    train_during_motion: true
