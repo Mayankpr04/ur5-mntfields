@@ -11,6 +11,7 @@ __pycache__/
 
 # Generated training/evaluation outputs
 src/ur5_sim_training*/
+ur5_sim_training_factorized_v4_nbv/
 src/mntfields_rgbd_model/
 *.pt
 *.pth
