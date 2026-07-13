@@ -17,16 +17,36 @@ class UR5PointCloudCollisionChecker:
         occupied_points: np.ndarray,
         box_obstacles: np.ndarray | None = None,
         sphere_assets_root: str = "/home/mayank/ur_ws/ntrl-demo/datasets/arm/UR5/meshes/sphere/sphere",
+        support_box_count: int = 0,
+        support_point_ignore_padding_m: float = 0.15,
     ):
         self.kinematics = kinematics
-        self.occupied_points = np.asarray(occupied_points, dtype=np.float64)
-        self.kdtree = cKDTree(self.occupied_points) if len(self.occupied_points) else None
+        raw_occupied_points = np.asarray(occupied_points, dtype=np.float64).reshape(-1, 3)
         if box_obstacles is None:
             self.box_obstacles = np.zeros((0, 6), dtype=np.float64)
+            valid = np.zeros((0,), dtype=bool)
         else:
             boxes = np.asarray(box_obstacles, dtype=np.float64).reshape(-1, 6)
             valid = np.all(np.isfinite(boxes), axis=1) & np.all(boxes[:, 3:] > 0.0, axis=1)
             self.box_obstacles = boxes[valid]
+        # Support boxes are appended after ordinary scene boxes. The base
+        # shoulder and the four proximal upper-arm spheres model the bolted
+        # shoulder pivot, which intentionally touches the support. All distal
+        # upper-arm and wrist geometry remains checked against it.
+        requested_support_count = min(max(0, int(support_box_count)), len(valid))
+        self.support_box_count = int(np.count_nonzero(valid[-requested_support_count:])) if requested_support_count else 0
+        self.support_point_ignore_padding_m = float(max(0.0, support_point_ignore_padding_m))
+        self.ignored_support_point_count = 0
+        if self.support_box_count and len(raw_occupied_points):
+            support_boxes = self.box_obstacles[-self.support_box_count :]
+            support_delta = np.abs(raw_occupied_points[:, None, :] - support_boxes[None, :, :3])
+            support_half_extents = 0.5 * support_boxes[None, :, 3:] + self.support_point_ignore_padding_m
+            inside_support = np.any(np.all(support_delta <= support_half_extents, axis=2), axis=1)
+            self.ignored_support_point_count = int(np.count_nonzero(inside_support))
+            self.occupied_points = raw_occupied_points[~inside_support]
+        else:
+            self.occupied_points = raw_occupied_points
+        self.kdtree = cKDTree(self.occupied_points) if len(self.occupied_points) else None
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         #print("Using device :" , self.device)
         self.sphere_assets_root = Path(sphere_assets_root)
@@ -73,6 +93,14 @@ class UR5PointCloudCollisionChecker:
         self.link_spheres_local_t = [
             torch.as_tensor(arr, dtype=torch.float32, device=self.device) for arr in self.link_spheres_local
         ]
+        sphere_count = sum(int(len(spheres)) for spheres in self.link_spheres_local)
+        self.support_contact_sphere_mask_t = torch.zeros((sphere_count,), dtype=torch.bool, device=self.device)
+        if sphere_count:
+            self.support_contact_sphere_mask_t[0] = True
+        if len(self.link_spheres_local) > 1 and len(self.link_spheres_local[1]):
+            upper_arm_offset = len(self.link_spheres_local[0])
+            proximal_count = min(4, len(self.link_spheres_local[1]))
+            self.support_contact_sphere_mask_t[upper_arm_offset : upper_arm_offset + proximal_count] = True
         self.urdf_joint_origin_t = [
             self._make_transform_torch((0.0, 0.0, float(self.kinematics.d[0])), (0.0, 0.0, 0.0)),
             self._make_transform_torch((0.0, 0.0, 0.0), (math.pi / 2.0, 0.0, 0.0)),
@@ -89,9 +117,27 @@ class UR5PointCloudCollisionChecker:
             boxes = torch.as_tensor(self.box_obstacles, dtype=torch.float32, device=self.device)
             self.box_centers_t = boxes[:, :3]
             self.box_half_extents_t = 0.5 * boxes[:, 3:]
+            self.support_box_mask_t = torch.zeros((len(self.box_obstacles),), dtype=torch.bool, device=self.device)
+            if self.support_box_count:
+                self.support_box_mask_t[-self.support_box_count :] = True
         else:
             self.box_centers_t = torch.zeros((0, 3), dtype=torch.float32, device=self.device)
             self.box_half_extents_t = torch.zeros((0, 3), dtype=torch.float32, device=self.device)
+            self.support_box_mask_t = torch.zeros((0,), dtype=torch.bool, device=self.device)
+
+    def _box_distance_candidates(
+        self,
+        signed_dist: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Mask only fixed support contact before selecting a box."""
+        if self.support_box_count <= 0:
+            return signed_dist
+        ignore_support = self.support_contact_sphere_mask_t.repeat(int(batch_size))
+        return signed_dist.masked_fill(
+            ignore_support[:, None] & self.support_box_mask_t[None, :],
+            float("inf"),
+        )
 
     def _make_transform_torch(self, xyz: tuple[float, float, float], rpy: tuple[float, float, float]) -> torch.Tensor:
         roll, pitch, yaw = rpy
@@ -223,7 +269,10 @@ class UR5PointCloudCollisionChecker:
                 outside_norm = torch.linalg.norm(outside, dim=2)
                 max_q, _ = torch.max(q_box, dim=2)
                 signed_dist = outside_norm + torch.minimum(max_q, torch.zeros_like(max_q))
-                box_dists, box_inds = torch.min(signed_dist, dim=1)
+                box_distance_candidates = self._box_distance_candidates(
+                    signed_dist, centers.shape[0]
+                )
+                box_dists, box_inds = torch.min(box_distance_candidates, dim=1)
 
                 chosen_delta = delta[torch.arange(flat_count, device=self.device), box_inds]
                 chosen_q = q_box[torch.arange(flat_count, device=self.device), box_inds]
@@ -457,11 +506,15 @@ class UR5SDFCollisionChecker(UR5PointCloudCollisionChecker):
         sdf_voxel_size_m: float = 0.04,
         sdf_padding_m: float = 0.75,
         sdf_max_cells: int = 4_000_000,
+        support_box_count: int = 0,
+        support_point_ignore_padding_m: float = 0.15,
     ):
         super().__init__(
             kinematics=kinematics,
             occupied_points=occupied_points,
             box_obstacles=box_obstacles,
+            support_box_count=support_box_count,
+            support_point_ignore_padding_m=support_point_ignore_padding_m,
             sphere_assets_root=sphere_assets_root,
         )
         self.sdf_voxel_size_m = float(max(1.0e-3, sdf_voxel_size_m))
@@ -601,7 +654,10 @@ class UR5SDFCollisionChecker(UR5PointCloudCollisionChecker):
                 outside_norm = torch.linalg.norm(outside, dim=2)
                 max_q, _ = torch.max(q_box, dim=2)
                 signed_dist = outside_norm + torch.minimum(max_q, torch.zeros_like(max_q))
-                box_dists, box_inds = torch.min(signed_dist, dim=1)
+                box_distance_candidates = self._box_distance_candidates(
+                    signed_dist, centers.shape[0]
+                )
+                box_dists, box_inds = torch.min(box_distance_candidates, dim=1)
 
                 chosen_delta = delta[torch.arange(flat_count, device=self.device), box_inds]
                 chosen_q = q_box[torch.arange(flat_count, device=self.device), box_inds]
@@ -666,6 +722,8 @@ def make_ur5_collision_checker(
     sdf_voxel_size_m: float = 0.04,
     sdf_padding_m: float = 0.75,
     sdf_max_cells: int = 4_000_000,
+    support_box_count: int = 0,
+    support_point_ignore_padding_m: float = 0.15,
 ) -> UR5PointCloudCollisionChecker:
     backend = str(clearance_backend or "original").strip().lower()
     if backend in {"sdf", "edt", "sdf_edt"}:
@@ -673,6 +731,8 @@ def make_ur5_collision_checker(
             kinematics,
             occupied_points,
             box_obstacles=box_obstacles,
+            support_box_count=support_box_count,
+            support_point_ignore_padding_m=support_point_ignore_padding_m,
             sdf_voxel_size_m=sdf_voxel_size_m,
             sdf_padding_m=sdf_padding_m,
             sdf_max_cells=sdf_max_cells,
@@ -683,4 +743,6 @@ def make_ur5_collision_checker(
         kinematics,
         occupied_points,
         box_obstacles=box_obstacles,
+        support_box_count=support_box_count,
+        support_point_ignore_padding_m=support_point_ignore_padding_m,
     )

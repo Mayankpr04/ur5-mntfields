@@ -3,121 +3,87 @@ import math
 import numpy as np
 import torch
 from torch import Tensor
-from torch.nn import LayerNorm, Linear
+from torch.nn import Linear
 
 
 torch.backends.cudnn.benchmark = True
 
 
-def sigmoid_out(input: Tensor) -> Tensor:
-    return torch.sigmoid(0.1 * input)
-
-
-class SigmoidOut(torch.nn.Module):
-    def forward(self, input: Tensor) -> Tensor:
-        return sigmoid_out(input)
-
-
 class NN(torch.nn.Module):
+    """Paper-faithful factorized NTField network.
+
+    The network predicts the bounded factor ``tau(q0, q1)``.  The arrival
+    time ``T = log(tau)^2 * ||q0 - q1||`` and all of its derivatives are
+    formed in :mod:`model_function_metric`, where the C-space dimension is
+    known.  Keeping that factorization outside this module makes it harder to
+    accidentally use gradients of tau as gradients of arrival time.
+    """
+
+    ARCHITECTURE_VERSION = "pinn_factorized_t_v2"
+
     def __init__(self, device: str, dim: int, B: Tensor):
         super().__init__()
-        self.dim = dim
+        self.dim = int(dim)
         self.B = B.T.to(device)
         self._fourier_w = 2.0 * math.pi * self.B
-        self.scale = 10
-        self.act = torch.nn.Softplus(beta=self.scale)
-        self.actout = SigmoidOut()
-        self.nl1 = 2
-        h_size = 256
+        self.hidden_dim = 128
         fourier_dim = 2 * self.B.shape[1]
 
-        self.encoder = torch.nn.ModuleList()
-        self.encoder_norm = LayerNorm(h_size)
-        self.encoder.append(Linear(fourier_dim, h_size))
-        for _ in range(3 * self.nl1):
-            self.encoder.append(Linear(h_size, h_size))
-        self.encoder.append(Linear(h_size, h_size))
+        # Eq. 8 and Fig. 3(a): one 256->128 sine layer followed by
+        # three 128->128 sine layers.
+        self.encoder = torch.nn.ModuleList([Linear(fourier_dim, self.hidden_dim)])
+        self.encoder.extend(Linear(self.hidden_dim, self.hidden_dim) for _ in range(3))
 
-        self.gate = torch.nn.ModuleList()
-        for _ in range(self.nl1):
-            self.gate.append(Linear(1, 1))
+        # Fig. 3(b): squared-difference symmetric feature, then three
+        # Softplus layers and a bounded scalar tau generator.
+        self.generator = torch.nn.ModuleList(
+            Linear(self.hidden_dim, self.hidden_dim) for _ in range(3)
+        )
+        self.output = Linear(self.hidden_dim, 1)
+        self.softplus = torch.nn.Softplus(beta=10.0)
 
-        self.pe_gate = torch.nn.ModuleList()
-        self.pe_gate.append(Linear(h_size, h_size))
-        self.pe_gate.append(Linear(h_size, h_size))
-
-    def init_weights(self, m):
-        if isinstance(m, torch.nn.Linear):
-            stdv = np.sqrt(2.0 / (m.weight.size(0) + m.weight.size(1)))
+    @staticmethod
+    def init_weights(module: torch.nn.Module):
+        if isinstance(module, torch.nn.Linear):
+            stdv = np.sqrt(2.0 / (module.weight.size(0) + module.weight.size(1)))
             torch.nn.init.trunc_normal_(
-                m.weight, mean=0.0, std=stdv, a=-2.0 * stdv, b=2.0 * stdv
+                module.weight,
+                mean=0.0,
+                std=stdv,
+                a=-2.0 * stdv,
+                b=2.0 * stdv,
             )
-            m.bias.data.fill_(0.0)
-
-        for gate in self.gate:
-            gate.weight.data.fill_(0.0)
-            gate.bias.data.fill_(0.0)
+            module.bias.data.zero_()
 
     def input_mapping(self, x: Tensor) -> Tensor:
         x_proj = x @ self._fourier_w
-        return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
+        return torch.cat((torch.cos(x_proj), torch.sin(x_proj)), dim=-1)
 
-    def lip_norm(self, w: Tensor) -> Tensor:
-        absrowsum = torch.sqrt(torch.sum(w**2, dim=1)).detach()
-        scale = 1 + 1e-5 - self.act(1 - 1 / absrowsum)
-        return w * scale.unsqueeze(1)
+    def _encode(self, q: Tensor) -> Tensor:
+        x = self.input_mapping(q)
+        for layer in self.encoder:
+            x = torch.sin(layer(x))
+        return x
 
-    def out(self, coords: Tensor):
+    def out(self, coords: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         coords = coords.clone().detach().requires_grad_(True)
         size = coords.shape[0]
+        if coords.ndim != 2 or coords.shape[1] != 2 * self.dim:
+            raise ValueError(
+                f"Expected pair coordinates [N,{2 * self.dim}], got {tuple(coords.shape)}"
+            )
 
-        x0 = coords[:, : self.dim]
-        x1 = coords[:, self.dim :]
-        x = torch.vstack((x0, x1))
-        x = self.input_mapping(x)
+        encoded = self._encode(torch.vstack((coords[:, : self.dim], coords[:, self.dim :])))
+        enc0 = encoded[:size]
+        enc1 = encoded[size:]
+        symmetric_feature = torch.square(enc0 - enc1)
 
-        w = self.lip_norm(self.pe_gate[0].weight)
-        b = self.pe_gate[0].bias
-        u = torch.sin(x @ w.T + b)
+        x = symmetric_feature
+        for layer in self.generator:
+            x = self.softplus(layer(x))
+        tau = torch.sigmoid(self.output(x))
+        return tau, self.output.weight, coords
 
-        w = self.lip_norm(self.pe_gate[1].weight)
-        b = self.pe_gate[1].bias
-        v = torch.sin(x @ w.T + b)
-
-        for ii in range(self.nl1):
-            x_tmp = x
-
-            w = self.lip_norm(self.encoder[3 * ii + 1].weight)
-            b = self.encoder[3 * ii + 1].bias
-            y = x @ w.T + b
-            x = u * torch.sin(y) + v * (1 - torch.sin(y))
-
-            w = self.lip_norm(self.encoder[3 * ii + 2].weight)
-            b = self.encoder[3 * ii + 2].bias
-            y = x @ w.T + b
-            x = u * torch.sin(y) + v * (1 - torch.sin(y))
-
-            w = self.lip_norm(self.encoder[3 * ii + 3].weight)
-            b = self.encoder[3 * ii + 3].bias
-            y = x @ w.T + b
-
-            weight = torch.sigmoid(0.1 * self.gate[ii].weight)
-            x = (1 - weight) * x_tmp + weight * torch.sin(y)
-
-        w = self.lip_norm(self.encoder[-1].weight)
-        b = self.encoder[-1].bias
-        y = x @ w.T + b
-        y = self.encoder_norm(y)
-
-        x0 = y[:size, ...]
-        x1 = y[size:, ...]
-        x = torch.sqrt((x0 - x1) ** 2 + 1e-6)
-        x = x.view(x.shape[0], -1, 16)
-        x = (torch.logsumexp(10 * x, dim=2) - np.log(16)) / 10
-        x = 0.2 * torch.sum(x, dim=1, keepdim=True)
-        return x, w, coords
-
-    def forward(self, coords: Tensor):
-        coords = coords.clone().detach().requires_grad_(True)
-        output, _w, coords = self.out(coords)
-        return output, coords
+    def forward(self, coords: Tensor) -> tuple[Tensor, Tensor]:
+        output, _w, mapped_coords = self.out(coords)
+        return output, mapped_coords

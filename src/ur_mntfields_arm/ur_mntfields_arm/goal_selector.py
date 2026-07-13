@@ -6,6 +6,10 @@ from sensor_msgs.msg import CameraInfo
 
 from ur_mntfields_arm.collision_checker import UR5PointCloudCollisionChecker
 from ur_mntfields_arm.frontier_bank import FrontierRecord
+from ur_mntfields_arm.roi_targeting import (
+    distribute_candidate_budget,
+    spatially_stratified_targets,
+)
 from ur_mntfields_arm.ur5_kinematics import UR5Kinematics, ViewGoal, _transform, look_at_rotation
 
 
@@ -41,7 +45,7 @@ class ViewGoalSelector:
         min_frontier_visibility_score: float = 0.05,
         min_roi_coverage_ratio: float = 0.08,
         min_view_alignment: float = 0.72,
-        min_actual_view_alignment: float = 0.88,
+        min_actual_view_alignment: float = 0.85,
         target_context_radius_m: float = 0.35,
         yaw_offsets_deg: tuple[float, ...] = (-12.0, 0.0, 12.0),
         pitch_offsets_deg: tuple[float, ...] = (-10.0, 0.0, 10.0),
@@ -49,10 +53,12 @@ class ViewGoalSelector:
         fast_roi_nbv: bool = True,
         roi_nbv_max_pose_candidates: int = 18,
         enable_self_occlusion_filter: bool = True,
-        min_self_occlusion_free_fraction: float = 0.80,
+        min_self_occlusion_free_fraction: float = 0.98,
         self_occlusion_padding_m: float = 0.03,
+        self_occlusion_ignore_near_origin_m: float = 0.06,
         self_occlusion_tool_radius_m: float = 0.08,
         self_occlusion_mount_radius_m: float = 0.07,
+        frontier_pose_candidates_per_frontier: int = 15,
     ):
         self.kinematics = kinematics
         self.camera_in_tool = camera_in_tool
@@ -64,6 +70,10 @@ class ViewGoalSelector:
         self.frontier_reselect_cooldown_steps = int(max(0, frontier_reselect_cooldown_steps))
         self.min_frontier_visibility_score = float(max(0.0, min_frontier_visibility_score))
         self.min_roi_coverage_ratio = float(np.clip(min_roi_coverage_ratio, 0.0, 1.0))
+        # ROI targets are optional, but a zero-quality target should never
+        # displace a valid frontier candidate.
+        self.min_roi_visibility_score = max(0.01, self.min_frontier_visibility_score)
+        self.min_roi_unknown_gain = max(0.01, self.min_roi_coverage_ratio)
         self.min_view_alignment = float(np.clip(min_view_alignment, -1.0, 1.0))
         self.min_actual_view_alignment = float(np.clip(min_actual_view_alignment, -1.0, 1.0))
         self.target_context_radius_m = float(max(0.05, target_context_radius_m))
@@ -75,8 +85,10 @@ class ViewGoalSelector:
         self.enable_self_occlusion_filter = bool(enable_self_occlusion_filter)
         self.min_self_occlusion_free_fraction = float(np.clip(min_self_occlusion_free_fraction, 0.0, 1.0))
         self.self_occlusion_padding_m = float(max(0.0, self_occlusion_padding_m))
+        self.self_occlusion_ignore_near_origin_m = float(max(0.0, self_occlusion_ignore_near_origin_m))
         self.self_occlusion_tool_radius_m = float(max(0.0, self_occlusion_tool_radius_m))
         self.self_occlusion_mount_radius_m = float(max(0.0, self_occlusion_mount_radius_m))
+        self.frontier_pose_candidates_per_frontier = max(3, int(frontier_pose_candidates_per_frontier))
         self.last_select_debug: dict[str, float | int] = {}
         self.frontier_pose_cache: dict[int, dict[str, object]] = {}
 
@@ -107,16 +119,49 @@ class ViewGoalSelector:
             cam_pos,
             target_points,
             padding_m=self.self_occlusion_padding_m,
+            ignore_near_origin_m=self.self_occlusion_ignore_near_origin_m,
             extra_spheres=self._tool_camera_extra_spheres(q_goal),
         )
         return float(np.clip(1.0 - occluded, 0.0, 1.0))
+
+    def _actual_target_view_is_valid(
+        self,
+        checker: UR5PointCloudCollisionChecker,
+        q_goal: np.ndarray,
+        actual_cam_pose: np.ndarray,
+        target: np.ndarray,
+        camera_info: CameraInfo | None,
+    ) -> tuple[bool, str]:
+        """Apply the final observation gate to the pose that IK actually reaches."""
+        actual_cam_pos = np.asarray(actual_cam_pose[:3, 3], dtype=np.float64)
+        target = np.asarray(target, dtype=np.float64).reshape(3)
+        ray = target - actual_cam_pos
+        ray_norm = float(np.linalg.norm(ray))
+        if ray_norm < 1.0e-6:
+            return False, "orientation"
+        alignment = float(np.dot(actual_cam_pose[:3, 2], ray / ray_norm))
+        if alignment < self.min_actual_view_alignment:
+            return False, "orientation"
+        if self._project_to_image(actual_cam_pose, target, camera_info) is None:
+            return False, "visibility"
+        if self._ray_clearance_score(checker, actual_cam_pos, target) <= 0.0:
+            return False, "visibility"
+        target_free_fraction = self._self_occlusion_free_fraction(
+            checker,
+            q_goal,
+            actual_cam_pos,
+            target.reshape(1, 3),
+        )
+        if target_free_fraction < self.min_self_occlusion_free_fraction:
+            return False, "self_occlusion"
+        return True, ""
 
     def _roi_unknown_centers(
         self,
         roi_min: np.ndarray,
         roi_max: np.ndarray,
         checker: UR5PointCloudCollisionChecker,
-        max_points: int = 300,
+        max_points: int | None = 300,
     ) -> np.ndarray:
         voxel = float(checker.voxel_size)
         lo_key = np.floor(np.asarray(roi_min, dtype=np.float64) / voxel).astype(int)
@@ -131,9 +176,36 @@ class ViewGoalSelector:
                     keys.append(key)
         if not keys:
             return np.zeros((0, 3), dtype=np.float64)
-        stride = max(1, int(math.ceil(len(keys) / max(1, int(max_points)))))
-        centers = [checker.key_to_center(key) for key in keys[::stride]]
-        return np.asarray(centers, dtype=np.float64)
+        centers = [checker.key_to_center(key) for key in keys]
+        centers_arr = np.asarray(centers, dtype=np.float64)
+
+        # The cabinet boxes are known collision geometry, not learnable empty
+        # space. Keeping their interior as "unknown" biases ROI gain toward
+        # wall/shelf volume and pulls the target toward the box center.
+        boxes = np.asarray(getattr(checker, "box_obstacles", np.zeros((0, 6))), dtype=np.float64).reshape(-1, 6)
+        if len(boxes):
+            delta = np.abs(centers_arr[:, None, :] - boxes[None, :, :3])
+            inside_known_geometry = np.any(np.all(delta <= 0.5 * boxes[None, :, 3:], axis=2), axis=1)
+            centers_arr = centers_arr[~inside_known_geometry]
+        if max_points is not None and int(max_points) > 0 and len(centers_arr) > int(max_points):
+            stride = max(1, int(math.ceil(len(centers_arr) / int(max_points))))
+            centers_arr = centers_arr[::stride]
+        return centers_arr
+
+    def _roi_stratified_targets(
+        self,
+        roi_min: np.ndarray,
+        roi_max: np.ndarray,
+        checker: UR5PointCloudCollisionChecker,
+    ) -> np.ndarray:
+        all_unknown = self._roi_unknown_centers(roi_min, roi_max, checker, max_points=None)
+        target_limit = min(8, max(1, self.roi_nbv_max_pose_candidates // 2))
+        return spatially_stratified_targets(
+            all_unknown,
+            roi_min,
+            roi_max,
+            max_targets=target_limit,
+        )
 
     def _roi_candidate_camera_poses(
         self,
@@ -141,6 +213,7 @@ class ViewGoalSelector:
         roi_max: np.ndarray,
         current_camera_xyz: np.ndarray | None,
         target_xyz: np.ndarray | None = None,
+        max_pose_candidates: int | None = None,
     ) -> list[tuple[np.ndarray, str]]:
         roi_min = np.asarray(roi_min, dtype=np.float64)
         roi_max = np.asarray(roi_max, dtype=np.float64)
@@ -171,18 +244,29 @@ class ViewGoalSelector:
             standoffs = (0.35, 0.50, 0.70)
             lateral_offsets = (-0.45 * size[1], 0.0, 0.45 * size[1])
             vertical_offsets = (-0.35 * size[2], 0.0, 0.35 * size[2])
+        pose_cap = self.roi_nbv_max_pose_candidates if max_pose_candidates is None else max(1, int(max_pose_candidates))
+        lateral_nonzero = [value for value in lateral_offsets if abs(float(value)) > 1.0e-8]
+        vertical_nonzero = [value for value in vertical_offsets if abs(float(value)) > 1.0e-8]
+        offset_pairs = [(0.0, 0.0)]
+        offset_pairs.extend((float(value), 0.0) for value in lateral_nonzero)
+        offset_pairs.extend((0.0, float(value)) for value in vertical_nonzero)
+        offset_pairs.extend(
+            (float(lateral_offset), float(vertical_offset))
+            for lateral_offset in lateral_nonzero
+            for vertical_offset in vertical_nonzero
+        )
         poses: list[tuple[np.ndarray, str]] = []
         for dist in standoffs:
             base_pos = target - dist * approach
-            for lateral_offset in lateral_offsets:
-                for vertical_offset in vertical_offsets:
-                    cam_pos = base_pos + lateral_offset * lateral + vertical_offset * vertical
-                    if self.fast_roi_nbv:
-                        poses.append((_transform(look_at_rotation(cam_pos, target), cam_pos), "roi_fast"))
-                    else:
-                        poses.extend(self._oriented_camera_poses(cam_pos, target, "roi"))
-                    if self.fast_roi_nbv and len(poses) >= self.roi_nbv_max_pose_candidates:
-                        return poses
+            for lateral_offset, vertical_offset in offset_pairs:
+                cam_pos = base_pos + lateral_offset * lateral + vertical_offset * vertical
+                if self.fast_roi_nbv:
+                    poses.append((_transform(look_at_rotation(cam_pos, target), cam_pos), "roi_fast"))
+                else:
+                    remaining = pose_cap - len(poses)
+                    poses.extend(self._oriented_camera_poses(cam_pos, target, "roi")[:remaining])
+                if len(poses) >= pose_cap:
+                    return poses
         return poses
 
     def _roi_view_metrics(
@@ -234,12 +318,21 @@ class ViewGoalSelector:
         current_q = np.asarray(current_q, dtype=np.float64)
         roi_min = np.asarray(roi_min, dtype=np.float64)
         roi_max = np.asarray(roi_max, dtype=np.float64)
-        roi_center = 0.5 * (roi_min + roi_max)
-        unknown_centers = self._roi_unknown_centers(roi_min, roi_max, checker)
-        roi_target = np.mean(unknown_centers, axis=0) if len(unknown_centers) else roi_center
+        # ROI targets carry the coverage diversity. A compact metric set is
+        # sufficient to rank them and avoids thousands of KD-tree rays before
+        # a candidate has even passed IK.
+        unknown_limit = 96 if self.fast_roi_nbv else 300
+        unknown_centers = self._roi_unknown_centers(
+            roi_min,
+            roi_max,
+            checker,
+            max_points=unknown_limit,
+        )
+        roi_targets = self._roi_stratified_targets(roi_min, roi_max, checker)
         stats = {
             "candidates_total": 0,
             "unknown_points": int(len(unknown_centers)),
+            "roi_targets": int(len(roi_targets)),
             "rejected_visibility": 0,
             "rejected_ik": 0,
             "rejected_clearance": 0,
@@ -250,90 +343,105 @@ class ViewGoalSelector:
             "accepted": 0,
         }
         ranked: list[ViewGoal] = []
-        for cam_pose, pose_kind in self._roi_candidate_camera_poses(
-            roi_min,
-            roi_max,
-            current_camera_xyz,
-            target_xyz=roi_target,
-        ):
-            stats["candidates_total"] += 1
-            cam_pos = cam_pose[:3, 3]
-            if (
-                current_camera_xyz is not None
-                and float(np.linalg.norm(cam_pos - np.asarray(current_camera_xyz, dtype=np.float64))) < self.min_camera_goal_delta_m
+        pose_budget = distribute_candidate_budget(self.roi_nbv_max_pose_candidates, len(roi_targets))
+        for roi_target, target_pose_budget in zip(roi_targets, pose_budget):
+            for cam_pose, pose_kind in self._roi_candidate_camera_poses(
+                roi_min,
+                roi_max,
+                current_camera_xyz,
+                target_xyz=roi_target,
+                max_pose_candidates=target_pose_budget,
             ):
-                stats["rejected_same_view"] += 1
-                continue
-            view_metrics = self._roi_view_metrics(
-                cam_pose, cam_pos, roi_target, unknown_centers, checker, camera_info
-            )
-            if view_metrics["visibility_score"] < self.min_frontier_visibility_score:
-                stats["rejected_visibility"] += 1
-                continue
-            tool_pose = self.kinematics.camera_to_tool_pose(cam_pose, self.camera_in_tool)
-            q_goal = self.kinematics.solve_ik(tool_pose, current_q)
-            if q_goal is None:
-                stats["rejected_ik"] += 1
-                continue
-            if float(np.max(np.abs(q_goal - current_q))) < self.min_goal_joint_delta_rad:
-                stats["rejected_same_pose"] += 1
-                continue
-            actual_tool_pose = self.kinematics.fk(q_goal)
-            actual_cam_pose = self.kinematics.tool_to_camera_pose(actual_tool_pose, self.camera_in_tool)
-            actual_cam_pos = actual_cam_pose[:3, 3]
-            actual_ray = roi_target - actual_cam_pos
-            actual_ray_norm = float(np.linalg.norm(actual_ray))
-            if actual_ray_norm < 1e-6:
-                stats["rejected_orientation"] += 1
-                continue
-            actual_alignment = float(np.dot(actual_cam_pose[:3, 2], actual_ray / actual_ray_norm))
-            if actual_alignment < self.min_actual_view_alignment:
-                stats["rejected_orientation"] += 1
-                continue
-            actual_metrics = self._roi_view_metrics(
-                actual_cam_pose, actual_cam_pos, roi_target, unknown_centers, checker, camera_info
-            )
-            if actual_metrics["visibility_score"] < self.min_frontier_visibility_score:
-                stats["rejected_visibility"] += 1
-                continue
-            target_bundle = unknown_centers
-            if len(target_bundle) == 0:
-                target_bundle = roi_target.reshape(1, 3)
-            else:
-                target_bundle = np.vstack((roi_target.reshape(1, 3), target_bundle))
-            self_free_fraction = self._self_occlusion_free_fraction(
-                checker, q_goal, actual_cam_pos, target_bundle
-            )
-            if self_free_fraction < self.min_self_occlusion_free_fraction:
-                stats["rejected_self_occlusion"] += 1
-                continue
-            clearance = checker.clearance(q_goal)
-            if clearance <= 0.0:
-                stats["rejected_clearance"] += 1
-                continue
-            move_cost = float(np.linalg.norm(q_goal - current_q))
-            score = (
-                actual_metrics["visibility_score"]
-                - 0.30 * move_cost
-                + 0.45 * min(float(clearance), 0.25)
-            )
-            ranked.append(
-                ViewGoal(
-                    frontier_id=-1,
-                    centroid=roi_target.copy(),
-                    camera_pose=actual_cam_pose.copy(),
-                    tool_pose=actual_tool_pose.copy(),
-                    q_goal=q_goal.copy(),
-                    score=float(score),
-                    pose_kind=pose_kind,
-                    visibility_score=float(actual_metrics["visibility_score"]),
-                    local_coverage=float(actual_metrics["unknown_gain"]),
-                    gain_score=float(actual_metrics.get("visible_unknown", 0.0)),
-                    move_cost=move_cost,
-                    clearance=float(clearance),
+                stats["candidates_total"] += 1
+                cam_pos = cam_pose[:3, 3]
+                if (
+                    current_camera_xyz is not None
+                    and float(np.linalg.norm(cam_pos - np.asarray(current_camera_xyz, dtype=np.float64))) < self.min_camera_goal_delta_m
+                ):
+                    stats["rejected_same_view"] += 1
+                    continue
+                # Only test the focus ray before IK. Full unknown-space gain
+                # is intentionally deferred until the actual IK camera pose
+                # has passed its target-observation gates.
+                if (
+                    self._project_to_image(cam_pose, roi_target, camera_info) is None
+                    or self._ray_clearance_score(checker, cam_pos, roi_target, collision_radius_m=0.04) <= 0.0
+                ):
+                    stats["rejected_visibility"] += 1
+                    continue
+                tool_pose = self.kinematics.camera_to_tool_pose(cam_pose, self.camera_in_tool)
+                q_goal = self.kinematics.solve_ik(tool_pose, current_q)
+                if q_goal is None:
+                    stats["rejected_ik"] += 1
+                    continue
+                if float(np.max(np.abs(q_goal - current_q))) < self.min_goal_joint_delta_rad:
+                    stats["rejected_same_pose"] += 1
+                    continue
+                actual_tool_pose = self.kinematics.fk(q_goal)
+                actual_cam_pose = self.kinematics.tool_to_camera_pose(actual_tool_pose, self.camera_in_tool)
+                actual_cam_pos = actual_cam_pose[:3, 3]
+                target_ok, reject_reason = self._actual_target_view_is_valid(
+                    checker,
+                    q_goal,
+                    actual_cam_pose,
+                    roi_target,
+                    camera_info,
                 )
-            )
-            stats["accepted"] += 1
+                if not target_ok:
+                    if reject_reason == "orientation":
+                        stats["rejected_orientation"] += 1
+                    elif reject_reason == "self_occlusion":
+                        stats["rejected_self_occlusion"] += 1
+                    else:
+                        stats["rejected_visibility"] += 1
+                    continue
+                actual_metrics = self._roi_view_metrics(
+                    actual_cam_pose, actual_cam_pos, roi_target, unknown_centers, checker, camera_info
+                )
+                if (
+                    actual_metrics["visibility_score"] < self.min_roi_visibility_score
+                    or actual_metrics["unknown_gain"] < self.min_roi_unknown_gain
+                ):
+                    stats["rejected_visibility"] += 1
+                    continue
+                target_bundle = unknown_centers
+                if len(target_bundle) == 0:
+                    target_bundle = roi_target.reshape(1, 3)
+                else:
+                    target_bundle = np.vstack((roi_target.reshape(1, 3), target_bundle))
+                bundle_free_fraction = self._self_occlusion_free_fraction(
+                    checker, q_goal, actual_cam_pos, target_bundle
+                )
+                if bundle_free_fraction < self.min_self_occlusion_free_fraction:
+                    stats["rejected_self_occlusion"] += 1
+                    continue
+                clearance = checker.clearance(q_goal)
+                if clearance <= 0.0:
+                    stats["rejected_clearance"] += 1
+                    continue
+                move_cost = float(np.linalg.norm(q_goal - current_q))
+                score = (
+                    actual_metrics["visibility_score"]
+                    - 0.30 * move_cost
+                    + 0.45 * min(float(clearance), 0.25)
+                )
+                ranked.append(
+                    ViewGoal(
+                        frontier_id=-1,
+                        centroid=roi_target.copy(),
+                        camera_pose=actual_cam_pose.copy(),
+                        tool_pose=actual_tool_pose.copy(),
+                        q_goal=q_goal.copy(),
+                        score=float(score),
+                        pose_kind=pose_kind,
+                        visibility_score=float(actual_metrics["visibility_score"]),
+                        local_coverage=float(actual_metrics["unknown_gain"]),
+                        gain_score=float(actual_metrics.get("visible_unknown", 0.0)),
+                        move_cost=move_cost,
+                        clearance=float(clearance),
+                    )
+                )
+                stats["accepted"] += 1
         self.last_select_debug = stats
         ranked.sort(key=lambda goal: goal.score, reverse=True)
         return ranked[: max(1, int(max_candidates))]
@@ -370,20 +478,27 @@ class ViewGoalSelector:
     def _candidate_camera_poses(self, frontier: FrontierRecord) -> list[tuple[np.ndarray, str]]:
         centroid, normal, tangents = self._frontier_frame(frontier)
         poses: list[tuple[np.ndarray, str]] = []
+        lateral_offsets = (0.0,) + tuple(value for value in self.lateral_offsets_m if abs(value) > 1.0e-8)
+        vertical_offsets = (0.0,) + tuple(value for value in self.vertical_offsets_m if abs(value) > 1.0e-8)
         for dist in self.stand_offs_m:
-            base_pos = centroid - dist * normal
-            for lateral in self.lateral_offsets_m:
-                for vertical in self.vertical_offsets_m:
+            # Frontier normals point from occupied geometry into observed free
+            # space. Camera candidates must stay on that free-space side.
+            base_pos = centroid + dist * normal
+            for lateral in lateral_offsets:
+                for vertical in vertical_offsets:
                     cam_pos = (
                         base_pos
                         + lateral * tangents[:, 0]
                         + vertical * tangents[:, 1]
                     )
-                    poses.extend(self._oriented_camera_poses(cam_pos, centroid, "local"))
+                    # Position offsets cover faces and edges. The 3x3
+                    # orientation cone only multiplied the expensive
+                    # visibility pass while making no new target visible.
+                    poses.append((_transform(look_at_rotation(cam_pos, centroid), cam_pos), "local"))
         recovery_standoffs = (0.60, 0.75)
-        recovery_offsets = (-0.22, 0.0, 0.22)
+        recovery_offsets = (0.0, -0.22, 0.22)
         for dist in recovery_standoffs:
-            base_pos = centroid - dist * normal
+            base_pos = centroid + dist * normal
             for lateral in recovery_offsets:
                 for vertical in recovery_offsets:
                     cam_pos = (
@@ -414,6 +529,15 @@ class ViewGoalSelector:
             "poses": list(poses),
         }
         return poses
+
+    def _frontier_pose_subset(self, frontier: FrontierRecord) -> list[tuple[np.ndarray, str]]:
+        """Retain near and recovery views without evaluating an unbounded cone."""
+        poses = self._cached_candidate_camera_poses(frontier)
+        local = [pose for pose in poses if pose[1] == "local"]
+        recovery = [pose for pose in poses if pose[1] == "recovery"]
+        local_budget = min(len(local), max(1, int(math.ceil(0.60 * self.frontier_pose_candidates_per_frontier))))
+        recovery_budget = min(len(recovery), self.frontier_pose_candidates_per_frontier - local_budget)
+        return local[:local_budget] + recovery[:recovery_budget]
 
     def _ray_clearance_score(
         self,
@@ -447,73 +571,11 @@ class ViewGoalSelector:
         checker: UR5PointCloudCollisionChecker,
         camera_info: CameraInfo | None,
     ) -> float:
-        focus = frontier.centroid.astype(np.float64)
-        view_dir = focus - cam_pos
-        view_norm = float(np.linalg.norm(view_dir))
-        if view_norm < 1e-6:
-            return -1e9
-        view_dir /= view_norm
-        gain = 0.0
-        unknown_gain = 0.0
-        counted_unknown: set[tuple[int, int, int]] = set()
-        nbrs = [
-            (-1, 0, 0),
-            (1, 0, 0),
-            (0, -1, 0),
-            (0, 1, 0),
-            (0, 0, -1),
-            (0, 0, 1),
-        ]
-        for rec in active_frontiers:
-            target = rec.centroid.astype(np.float64)
-            ray = target - cam_pos
-            dist = float(np.linalg.norm(ray))
-            if dist < 1e-6 or dist > 1.25:
-                continue
-            ray_dir = ray / dist
-            facing = float(np.dot(ray_dir, rec.normal.astype(np.float64)))
-            if facing < 0.15:
-                continue
-            optical_align = float(np.dot(view_dir, ray_dir))
-            if optical_align < 0.85:
-                continue
-            proj = self._project_to_image(cam_pose, target, camera_info)
-            if proj is None:
-                continue
-            _, _, depth = proj
-            visibility = self._ray_clearance_score(checker, cam_pos, target)
-            if visibility <= 0.0:
-                continue
-            depth_score = 1.0 / (1.0 + 0.6 * max(0.0, depth - 0.35))
-            gain += visibility * optical_align * depth_score * (1.0 + 0.03 * rec.voxel_count)
-            # Adapt the global_scene idea: reward candidate views that can expose
-            # nearby unknown voxels at the frontier boundary, not just the centroid.
-            voxel_stride = max(1, len(rec.voxels) // 24)
-            for vx, vy, vz in rec.voxels[::voxel_stride]:
-                for dx, dy, dz in nbrs:
-                    unk = (vx + dx, vy + dy, vz + dz)
-                    if unk in counted_unknown:
-                        continue
-                    if unk in checker.free_keys or unk in checker.occupied_keys:
-                        continue
-                    unk_center = checker.key_to_center(unk)
-                    unk_ray = unk_center - cam_pos
-                    unk_dist = float(np.linalg.norm(unk_ray))
-                    if unk_dist < 1e-6 or unk_dist > 1.35:
-                        continue
-                    unk_dir = unk_ray / unk_dist
-                    if float(np.dot(view_dir, unk_dir)) < 0.80:
-                        continue
-                    if self._project_to_image(cam_pose, unk_center, camera_info) is None:
-                        continue
-                    if float(np.dot(unk_dir, rec.normal.astype(np.float64))) < 0.05:
-                        continue
-                    unk_vis = self._ray_clearance_score(checker, cam_pos, unk_center, collision_radius_m=0.04)
-                    if unk_vis <= 0.0:
-                        continue
-                    counted_unknown.add(unk)
-                    unknown_gain += unk_vis
-        return gain + 0.12 * unknown_gain
+        del cam_pose, cam_pos, active_frontiers, checker, camera_info
+        # Candidate generation already covers local face/edge offsets.  The
+        # former voxel-neighbour ray sweep made every pose O(frontiers *
+        # voxels), turning NBV into the dominant online-training cost.
+        return 0.25 + 0.75 * min(1.0, float(frontier.voxel_count) / 24.0)
 
     def _target_neighborhood(
         self,
@@ -521,14 +583,15 @@ class ViewGoalSelector:
         active_frontiers: list[FrontierRecord],
     ) -> list[FrontierRecord]:
         center = frontier.centroid.astype(np.float64)
-        neighborhood = [frontier]
+        nearby: list[tuple[float, FrontierRecord]] = []
         for rec in active_frontiers:
             if rec.frontier_id == frontier.frontier_id:
                 continue
             dist = float(np.linalg.norm(rec.centroid.astype(np.float64) - center))
             if dist <= self.target_context_radius_m:
-                neighborhood.append(rec)
-        return neighborhood
+                nearby.append((dist, rec))
+        nearby.sort(key=lambda item: item[0])
+        return [frontier] + [rec for _dist, rec in nearby[:7]]
 
     def _candidate_view_metrics(
         self,
@@ -552,7 +615,10 @@ class ViewGoalSelector:
             }
         view_dir = focus_ray / focus_dist
         target_visibility = self._ray_clearance_score(checker, cam_pos, focus)
-        if target_visibility <= 0.0 or self._project_to_image(cam_pose, focus, camera_info) is None:
+        cam_from_world = np.linalg.inv(cam_pose)
+        if target_visibility <= 0.0 or self._project_to_image(
+            cam_pose, focus, camera_info, cam_from_world=cam_from_world
+        ) is None:
             return {
                 "visibility_score": -1e9,
                 "local_coverage": 0.0,
@@ -575,7 +641,7 @@ class ViewGoalSelector:
             optical_align = float(np.dot(view_dir, ray_dir))
             if optical_align < self.min_view_alignment:
                 continue
-            proj = self._project_to_image(cam_pose, target, camera_info)
+            proj = self._project_to_image(cam_pose, target, camera_info, cam_from_world=cam_from_world)
             if proj is None:
                 continue
             visibility = self._ray_clearance_score(checker, cam_pos, target)
@@ -586,31 +652,12 @@ class ViewGoalSelector:
         local_coverage = float(visible_local) / float(total_local)
         mean_alignment = 0.0 if visible_local == 0 else alignment_sum / float(visible_local)
 
-        visible_global = 0
-        total_global = max(1, len(active_frontiers))
-        for rec in active_frontiers:
-            target = rec.centroid.astype(np.float64)
-            ray = target - cam_pos
-            dist = float(np.linalg.norm(ray))
-            if dist < 1e-6 or dist > 1.35:
-                continue
-            ray_dir = ray / dist
-            if float(np.dot(view_dir, ray_dir)) < self.min_view_alignment:
-                continue
-            if self._project_to_image(cam_pose, target, camera_info) is None:
-                continue
-            if self._ray_clearance_score(checker, cam_pos, target) <= 0.0:
-                continue
-            visible_global += 1
-        global_context = float(visible_global) / float(total_global)
-
         gain_score = self._candidate_gain(cam_pose, cam_pos, frontier, active_frontiers, checker, camera_info)
         visibility_score = (
             0.65 * target_visibility
             + 0.35 * local_coverage
-            + 0.10 * global_context
             + 0.10 * mean_alignment
-            + 0.15 * max(0.0, gain_score)
+            + 0.10 * gain_score
         )
         return {
             "visibility_score": float(visibility_score),
@@ -618,7 +665,7 @@ class ViewGoalSelector:
             "view_alignment": float(mean_alignment),
             "gain_score": float(gain_score),
             "target_visibility": float(target_visibility),
-            "global_context": float(global_context),
+            "global_context": 0.0,
             "visible_frontiers": float(visible_local),
         }
 
@@ -627,10 +674,13 @@ class ViewGoalSelector:
         cam_pose: np.ndarray,
         point_world: np.ndarray,
         camera_info: CameraInfo | None,
+        *,
+        cam_from_world: np.ndarray | None = None,
     ) -> tuple[float, float, float] | None:
         if camera_info is None:
             return None
-        cam_from_world = np.linalg.inv(cam_pose)
+        if cam_from_world is None:
+            cam_from_world = np.linalg.inv(cam_pose)
         p_world = np.ones((4,), dtype=np.float64)
         p_world[:3] = np.asarray(point_world, dtype=np.float64)
         p_cam = cam_from_world @ p_world
@@ -656,12 +706,38 @@ class ViewGoalSelector:
         current_camera_xyz: np.ndarray | None = None,
         step_idx: int | None = None,
         max_candidates: int = 12,
+        max_frontiers: int | None = None,
         progress_cb=None,
     ) -> list[ViewGoal]:
         current_q = np.asarray(current_q, dtype=np.float64)
         current_camera_xyz = None if current_camera_xyz is None else np.asarray(current_camera_xyz, dtype=np.float64)
         ranked: list[ViewGoal] = []
-        ranked_frontiers = sorted(frontiers, key=lambda rec: rec.voxel_count, reverse=True)[:18]
+        frontier_limit = 12 if max_frontiers is None else max(1, int(max_frontiers))
+        ordered_frontiers = sorted(frontiers, key=lambda rec: rec.voxel_count, reverse=True)
+        if len(ordered_frontiers) <= frontier_limit:
+            ranked_frontiers = ordered_frontiers
+        else:
+            # A small fallback budget should cover different cabinet faces,
+            # rather than repeatedly scoring adjacent high-count voxels.
+            ranked_frontiers = [ordered_frontiers[0]]
+            remaining_frontiers = list(ordered_frontiers[1:])
+            while remaining_frontiers and len(ranked_frontiers) < frontier_limit:
+                best_index = max(
+                    range(len(remaining_frontiers)),
+                    key=lambda idx: (
+                        min(
+                            float(
+                                np.linalg.norm(
+                                    remaining_frontiers[idx].centroid.astype(np.float64)
+                                    - selected.centroid.astype(np.float64)
+                                )
+                            )
+                            for selected in ranked_frontiers
+                        ),
+                        int(remaining_frontiers[idx].voxel_count),
+                    ),
+                )
+                ranked_frontiers.append(remaining_frontiers.pop(best_index))
         stats = {
             "frontiers_considered": len(ranked_frontiers),
             "candidates_total": 0,
@@ -675,9 +751,11 @@ class ViewGoalSelector:
             "rejected_orientation": 0,
             "rejected_self_occlusion": 0,
             "accepted": 0,
+            "rejected_frontier_ids": [],
         }
         last_progress_count = 0
         for frontier in ranked_frontiers:
+            accepted_before_frontier = int(stats["accepted"])
             if (
                 step_idx is not None
                 and self.frontier_reselect_cooldown_steps > 0
@@ -686,7 +764,7 @@ class ViewGoalSelector:
             ):
                 stats["rejected_cooldown"] += 1
                 continue
-            for cam_pose, pose_kind in self._cached_candidate_camera_poses(frontier):
+            for cam_pose, pose_kind in self._frontier_pose_subset(frontier):
                 stats["candidates_total"] += 1
                 cam_pos = cam_pose[:3, 3]
                 if (
@@ -698,18 +776,7 @@ class ViewGoalSelector:
                 if self._project_to_image(cam_pose, frontier.centroid.astype(np.float64), camera_info) is None:
                     stats["rejected_gain"] += 1
                     continue
-                view_metrics = self._candidate_view_metrics(
-                    cam_pose,
-                    cam_pos,
-                    frontier,
-                    frontiers,
-                    checker,
-                    camera_info,
-                )
-                if (
-                    view_metrics["visibility_score"] < self.min_frontier_visibility_score
-                    or view_metrics["local_coverage"] < self.min_roi_coverage_ratio
-                ):
+                if self._ray_clearance_score(checker, cam_pos, frontier.centroid.astype(np.float64)) <= 0.0:
                     stats["rejected_visibility"] += 1
                     continue
                 tool_pose = self.kinematics.camera_to_tool_pose(cam_pose, self.camera_in_tool)
@@ -724,14 +791,20 @@ class ViewGoalSelector:
                 actual_cam_pose = self.kinematics.tool_to_camera_pose(actual_tool_pose, self.camera_in_tool)
                 actual_cam_pos = actual_cam_pose[:3, 3]
                 target = frontier.centroid.astype(np.float64)
-                actual_ray = target - actual_cam_pos
-                actual_ray_norm = float(np.linalg.norm(actual_ray))
-                if actual_ray_norm < 1e-6:
-                    stats["rejected_orientation"] += 1
-                    continue
-                actual_alignment = float(np.dot(actual_cam_pose[:3, 2], actual_ray / actual_ray_norm))
-                if actual_alignment < self.min_actual_view_alignment:
-                    stats["rejected_orientation"] += 1
+                target_ok, reject_reason = self._actual_target_view_is_valid(
+                    checker,
+                    q_goal,
+                    actual_cam_pose,
+                    target,
+                    camera_info,
+                )
+                if not target_ok:
+                    if reject_reason == "orientation":
+                        stats["rejected_orientation"] += 1
+                    elif reject_reason == "self_occlusion":
+                        stats["rejected_self_occlusion"] += 1
+                    else:
+                        stats["rejected_visibility"] += 1
                     continue
                 actual_view_metrics = self._candidate_view_metrics(
                     actual_cam_pose,
@@ -746,12 +819,6 @@ class ViewGoalSelector:
                     or actual_view_metrics["local_coverage"] < self.min_roi_coverage_ratio
                 ):
                     stats["rejected_visibility"] += 1
-                    continue
-                self_free_fraction = self._self_occlusion_free_fraction(
-                    checker, q_goal, actual_cam_pos, frontier.centroid.reshape(1, 3)
-                )
-                if self_free_fraction < self.min_self_occlusion_free_fraction:
-                    stats["rejected_self_occlusion"] += 1
                     continue
                 clearance = checker.clearance(q_goal)
                 if clearance <= 0.0:
@@ -796,6 +863,8 @@ class ViewGoalSelector:
                 if progress_cb is not None and (stats["candidates_total"] - last_progress_count) >= 20:
                     last_progress_count = int(stats["candidates_total"])
                     progress_cb(dict(stats))
+            if int(stats["accepted"]) == accepted_before_frontier:
+                stats.setdefault("rejected_frontier_ids", []).append(int(frontier.frontier_id))
         self.last_select_debug = stats
         ranked.sort(key=lambda goal: goal.score, reverse=True)
         return ranked[: max(1, int(max_candidates))]

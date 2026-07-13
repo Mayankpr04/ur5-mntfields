@@ -35,6 +35,7 @@ setup(
             "view_field_speed_3d = ur_mntfields_arm.view_field_speed_3d:main",
             "view_field_trajectories_3d = ur_mntfields_arm.view_field_trajectories_3d:main",
             "view_planner_score_sweep_3d = ur_mntfields_arm.view_planner_score_sweep_3d:main",
+            "view_goal_candidate_sweep_3d = ur_mntfields_arm.view_goal_candidate_sweep_3d:main",
         ],
     },
 )

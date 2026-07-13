@@ -148,7 +148,6 @@ def _predict_speeds_to_goal(
 
 def _trajectory_states(
     planner: ArmFieldPlanner,
-    checker: UR5PointCloudCollisionChecker,
     start_q: np.ndarray,
     goals_q: np.ndarray,
     args: argparse.Namespace,
@@ -162,16 +161,15 @@ def _trajectory_states(
     for leg_idx, (qa, qb) in enumerate(zip(sequence[:-1], sequence[1:]), start=1):
         if args.leg != 0 and args.leg != leg_idx:
             continue
-        plan = planner.plan_collision_aware(
-            checker,
+        plan = planner.plan_learned_speed_search(
             qa,
             qb,
             args.step_size_q,
             args.rollout_max_steps,
-            clearance_margin_m=args.collision_margin_m,
+            min_predicted_speed=args.min_predicted_speed,
             max_local_candidates=args.local_candidates,
             allow_direct_edge=not args.no_direct_edge,
-            shortcut_path=not args.no_shortcut,
+            mode="bidirectional",
         )
         dense = _sample_joint_path(plan, args.tool_sample_step_rad)
         legs.append((dense, qb, dict(planner.last_debug)))
@@ -182,7 +180,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="View learned UR5 field predicted speeds in 3D. Red=low predicted speed, blue=high."
     )
-    parser.add_argument("--root", type=Path, default=Path("src/ur5_sim_training_urdf_fk"), help="Training output root.")
+    parser.add_argument("--root", type=Path, default=Path("src/ur5_sim_training_factorized_v2"), help="Training output root.")
     parser.add_argument("--step", default="latest", help="Step id like 000128 or 'latest'.")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Checkpoint path. Defaults to weights_final/latest epoch.")
     parser.add_argument("--mode", choices=["replay", "trajectory", "both"], default="both")
@@ -193,10 +191,9 @@ def main() -> None:
     parser.add_argument("--return-to-first", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--step-size-q", type=float, default=0.03)
     parser.add_argument("--rollout-max-steps", type=int, default=120)
-    parser.add_argument("--collision-margin-m", type=float, default=0.01)
+    parser.add_argument("--min-predicted-speed", type=float, default=0.10)
     parser.add_argument("--local-candidates", type=int, default=32)
     parser.add_argument("--no-direct-edge", action="store_true", help="Force field rollout instead of direct valid edge.")
-    parser.add_argument("--no-shortcut", action="store_true", help="Show unshortcutted planner path.")
     parser.add_argument("--tool-sample-step-rad", type=float, default=0.035)
     parser.add_argument("--point-size", type=float, default=5.0)
     parser.add_argument("--no-view", action="store_true")
@@ -214,7 +211,7 @@ def main() -> None:
     model = ArmFieldModel(str(root / "model"))
     model.load_checkpoint(checkpoint)
     occupied = _load_occupied(root, sample_file, data)
-    checker = UR5PointCloudCollisionChecker(kin, occupied)
+    evaluation_checker = UR5PointCloudCollisionChecker(kin, occupied)
 
     geoms = []
     if len(occupied):
@@ -237,7 +234,7 @@ def main() -> None:
     if args.mode in ("trajectory", "both"):
         planner = ArmFieldPlanner(model, kin)
         for leg_idx, (states_q, q_goal, debug) in enumerate(
-            _trajectory_states(planner, checker, DEFAULT_START_Q, DEFAULT_GOALS_Q, args),
+            _trajectory_states(planner, DEFAULT_START_Q, DEFAULT_GOALS_Q, args),
             start=1,
         ):
             if len(states_q) == 0:
@@ -245,6 +242,8 @@ def main() -> None:
                 continue
             states_n = np.asarray([kin.normalize(q) for q in states_q], dtype=np.float32)
             speeds = _predict_speeds_to_goal(model, kin, states_n, q_goal)
+            geometric_clearance = evaluation_checker.clearance_batch(states_q.astype(np.float32))
+            geometric_min = float(np.min(geometric_clearance)) if len(geometric_clearance) else float("nan")
             pts = _tool_points(kin, states_q)
             geoms.append(_make_point_cloud(pts, _speed_colors(speeds)))
             geoms.append(_line_set(pts, (0.05, 0.05, 0.05)))
@@ -254,6 +253,7 @@ def main() -> None:
                 f"trajectory leg={leg_idx} points={len(states_q)} planner_status={debug.get('status')} "
                 f"pred_speed min={float(np.min(speeds)):.4f} mean={float(np.mean(speeds)):.4f} "
                 f"max={float(np.max(speeds)):.4f} low<0.2={float(np.mean(speeds < 0.2)):.3f}"
+                f" geometric_eval_min_clearance_m={geometric_min:.4f}"
             )
 
     geoms.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.2))

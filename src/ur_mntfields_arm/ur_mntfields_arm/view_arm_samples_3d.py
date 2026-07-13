@@ -98,7 +98,7 @@ def _selected_pairs(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="View UR5 MNTFields samples with occupied PCD and sphere model overlays.")
-    parser.add_argument("--root", type=Path, default=Path("src/ur5_sim_training_urdf_fk"), help="Training output root.")
+    parser.add_argument("--root", type=Path, default=Path("src/ur5_sim_training_factorized_v2"), help="Training output root.")
     parser.add_argument("--step", default="latest", help="Step id like 000128 or 'latest'.")
     parser.add_argument("--show-depth", action="store_true", help="Also show step_*_depth_world.pcd when present.")
     parser.add_argument("--sample-pairs", type=int, default=3, help="Number of q0/q1 sample pairs to overlay.")

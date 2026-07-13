@@ -23,10 +23,17 @@ class FrontierRecord:
 
 
 class FrontierBank:
-    def __init__(self, match_radius_m: float = 0.18, visit_radius_m: float = 0.20, max_failures: int = 4):
+    def __init__(
+        self,
+        match_radius_m: float = 0.18,
+        visit_radius_m: float = 0.20,
+        max_failures: int = 4,
+        normal_match_cos: float = 0.35,
+    ):
         self.match_radius_m = float(match_radius_m)
         self.visit_radius_m = float(visit_radius_m)
         self.max_failures = int(max_failures)
+        self.normal_match_cos = float(np.clip(normal_match_cos, -1.0, 1.0))
         self._next_id = 1
         self.records: dict[int, FrontierRecord] = {}
 
@@ -53,12 +60,26 @@ class FrontierBank:
 
     def update(self, clusters: list[FrontierCluster], step_idx: int):
         unmatched = set(self.records.keys())
-        for cluster in clusters:
+        # A previous record may only absorb one cluster per update. Without
+        # this, nearby cabinet faces can all overwrite the same record and
+        # starve the remaining face from viewpoint selection.
+        for cluster in sorted(clusters, key=lambda item: len(item.voxels), reverse=True):
             best_id = None
             best_dist = float("inf")
-            for frontier_id, rec in self.records.items():
+            cluster_normal = np.asarray(cluster.normal, dtype=np.float64)
+            cluster_normal_norm = float(np.linalg.norm(cluster_normal))
+            for frontier_id in unmatched:
+                rec = self.records[frontier_id]
                 dist = float(np.linalg.norm(rec.centroid - cluster.centroid))
-                if dist < self.match_radius_m and dist < best_dist:
+                if dist >= self.match_radius_m or dist >= best_dist:
+                    continue
+                rec_normal = np.asarray(rec.normal, dtype=np.float64)
+                rec_normal_norm = float(np.linalg.norm(rec_normal))
+                if cluster_normal_norm > 1.0e-8 and rec_normal_norm > 1.0e-8:
+                    normal_cos = float(np.dot(cluster_normal, rec_normal) / (cluster_normal_norm * rec_normal_norm))
+                    if normal_cos < self.normal_match_cos:
+                        continue
+                if dist < best_dist:
                     best_dist = dist
                     best_id = frontier_id
             if best_id is None:

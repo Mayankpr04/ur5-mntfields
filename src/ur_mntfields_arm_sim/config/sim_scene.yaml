@@ -45,10 +45,15 @@ test_trained_field:
     robot_self_filter_padding_m: 0.04
     robot_self_filter_tool_radius_m: 0.08
     robot_self_filter_mount_radius_m: 0.07
+    # Use the voxel SDF only for high-volume sample labels and NBV ranking.
+    # Exact point-cloud checks remain active for every execution plan.
     clearance_backend: original
+    sampling_clearance_backend: sdf
+    nbv_clearance_backend: sdf
     sdf_voxel_size_m: 0.04
     sdf_padding_m: 0.75
     sdf_max_cells: 4000000
+    trajectory_collision_margin_m: 0.02
     scene_boxes_frame: world
     scene_boxes:
       - "0.98,0.35,0.90,0.04,1.40,1.80"
@@ -59,6 +64,9 @@ test_trained_field:
       - "0.84,0.35,0.46,0.24,1.32,0.02"
       - "0.84,0.35,0.90,0.24,1.32,0.02"
       - "0.84,0.35,1.34,0.24,1.32,0.02"
+    support_boxes:
+      - "0.15,0.35,0.25,0.55,0.55,0.50"
+    support_boxes_frame: world
 arm_mntfields_explorer:
   ros__parameters:
     depth_topic: /camera/camera/aligned_depth_to_color/image_raw
@@ -76,7 +84,7 @@ arm_mntfields_explorer:
     tool_frame: tool0
     visualization_frame: world
     ur_type: ur5
-    output_dir: /home/mayank/ur_ws/src/ur5_sim_training_urdf_fk
+    output_dir: /home/mayank/ur_ws/src/ur5_sim_training_factorized_v9_v6_reverted
     camera_in_tool: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.10, 0.0, 0.0, 0.0, 1.0]
     voxel_size_m: 0.05
     frontier_match_radius_m: 0.18
@@ -90,90 +98,161 @@ arm_mntfields_explorer:
     robot_self_filter_tool_radius_m: 0.08
     robot_self_filter_mount_radius_m: 0.07
     clearance_backend: original
+    # Use the bounded voxel SDF for high-volume labels and view ranking. Exact
+    # point-cloud clearance remains active for execution validation/planning.
+    sampling_clearance_backend: sdf
+    nbv_clearance_backend: sdf
     sdf_voxel_size_m: 0.04
     sdf_padding_m: 0.75
     sdf_max_cells: 4000000
+    # Reproduce the successful v6 balanced-shell distribution. Seven thousand
+    # ordinary pairs gave each update enough free and obstacle-side coverage;
+    # the v8 4k + priority-hard policy depressed the entire free-space field.
     sample_pairs_per_step: 7000
     samples_per_ik_seed: 32
     sampling_mode: joint_local_6d
-    sampling_proposal_batch_size: 512
-    clearance_margin_m: 0.15
-    clearance_offset_m: 0.0
+    sampling_proposal_batch_size: 256
+    # Match the reference's thin boundary-shell construction more closely.
+    # Ten millimetres remains resolvable with the online SDF while the 0.10 m
+    # margin supplies an explicit surrounding clear/high-speed band.
+    clearance_margin_m: 0.10
+    clearance_offset_m: 0.010
     clearance_label_floor: 0.0
     clearance_label_power: 1.0
     anchor_seed_probability: 0.35
+    # Keep a bounded ROI-conditioned component in the fast joint sampler;
+    # the rest remains broad C-space coverage.
+    roi_sampling_seed_fraction: 0.25
     use_field_eval_anchors_for_sampling: false
+    # Do not specialize field training to the fixed test goals. Boundary-shell
+    # discovery is global; only paths actually generated during exploration
+    # may later contribute local online anchors.
+    use_configured_training_anchors: false
+    training_anchor_joint_goals: [
+      0.0, -1.20804, 1.09161, -2.81853, -1.57000, 0.03334,
+      0.0, -0.83967, 1.61948, -4.01894, -1.57000, 0.03334,
+      -0.77152, -0.68967, 1.43704, -3.81446, -1.57000, 0.03334,
+    ]
+    # Sampling dominates wall time on the manipulator. Reuse each labelled
+    # batch enough times to reach a useful field inside ten minutes.
     train_epochs_per_step: 180
     train_every_n_frames: 1
-    replay_buffer_capacity: 100000
-    train_minibatch_size: 7000
+    replay_buffer_capacity: 200000
+    train_minibatch_size: 1024
+    # Two 1024-row microbatches provide a 2048-row effective update without
+    # holding the loss's second-derivative graph for all rows at once.
+    train_gradient_accumulation_steps: 2
     train_replay_ratio: 0.75
-    replay_recombine_pairs_per_step: 7000
-    adaptive_training_enabled: true
+    # V6 used uniform Algorithm-1 replay with no reserved hard-example quota.
+    # Keep the implementation available for ablations, but disable it here.
+    hard_example_train_ratio: 0.0
+    replay_recombine_pairs_per_step: 0
+    # Do not reduce the update budget after a transient diagnostic gate; the
+    # online run has a fixed sub-ten-minute convergence deadline.
+    adaptive_training_enabled: false
     field_ready_sample_pairs_per_step: 7000
-    field_ready_train_epochs_per_step: 180
-    field_ready_train_every_n_frames: 1
-    field_ready_replay_recombine_pairs_per_step: 7000
-    field_ready_hard_failed_pairs_per_step: 128
+    field_ready_train_epochs_per_step: 120
+    field_ready_train_every_n_frames: 3
+    field_ready_replay_recombine_pairs_per_step: 0
+    field_ready_hard_failed_pairs_per_step: 0
+    # Keep a small online quota around paths actually explored, but devote the
+    # main distribution equally to global obstacle shells and surrounding
+    # broad/free configurations. No candidate test corridor is enumerated.
     path_centered_pair_fraction: 0.10
-    near_boundary_pair_fraction: 0.35
+    near_boundary_pair_fraction: 0.45
     path_anchor_stride: 4
     path_anchor_buffer_limit: 7000
-    hard_failed_pairs_per_step: 128
+    # Match v6: failed paths may still be logged for analysis, but they do not
+    # alter the training distribution.
+    hard_failed_pairs_per_step: 0
     hard_failed_anchor_buffer_limit: 7000
     hard_failed_clearance_window_m: 0.08
     step_size_q: 0.03
     rollout_max_steps: 120
-    execution_planner: field
+    # Prefer the learned field, but use a collision-aware fallback while the
+    # online model is still below its certification gate.
+    execution_planner: field_then_rrt
     collision_aware_field_rollout: true
     field_local_rollout_candidates: 32
-    rrt_max_iters: 4000
+    # Avoid a failed fallback blocking the synchronous callback for ~30 s.
+    rrt_max_iters: 800
     rrt_goal_bias: 0.20
     enable_trajectory_publish: true
     trajectory_topic: /ur_mntfields_arm/joint_trajectory
+    # Training occurs at irregular camera-frame indices; modulo-20 skipped all
+    # of the latest run's collected views (105, 151, 176, 199, 216).
     save_every_n_steps: 1
     checkpoint_every_epochs: 120
-    enable_field_diagnostics: false
-    field_diagnostics_max_rows: 7000
+    enable_field_diagnostics: true
+    field_diagnostics_max_rows: 1024
     field_diagnostics_grid_size: 61
-    field_td_loss_weight: 0.001
+    field_diagnostics_every_n_train_updates: 5
+    field_diagnostics_save_joint_slices: false
+    # Paper Eq. 12 only. Auxiliary log-speed, directional-normal, risk
+    # reweighting, and synthetic zero-speed barrier objectives created a
+    # second solution mode with nearly infinite gradients (predicted speed 0).
+    field_td_loss_weight: 0.0
     field_speed_loss_weight: 0.01
+    field_log_speed_loss_weight: 0.0
     field_direct_speed_loss_weight: 0.0
-    field_normal_loss_weight: 0.001
+    field_normal_loss_weight: 0.0
     field_normal_cos_loss_weight: 0.0
     field_near_obstacle_loss_weight: 0.0
     field_low_speed_threshold: 0.20
     field_low_speed_pred_max: 0.30
     field_low_speed_penalty_weight: 0.0
-    field_effective_speed_floor: 0.04
+    field_effective_speed_floor: 0.10
     field_diag_gate_enabled: true
     field_diag_gate_min_replay_pairs: 12000
     field_diag_max_low_overpred_frac: 0.45
     field_diag_min_speed_corr: 0.35
     field_diag_min_near_far_gap: 0.20
     field_diag_min_normal_cos_near: 0.20
+    # Replay-fit plots cannot expose unsampled false-free pockets. Before a
+    # checkpoint may become weights_final.pt, label fresh full-C-space states
+    # with the exact checker and hard-mine any obstacle state predicted free.
+    # This post-v6 certification/mining gate remains available for experiments.
+    # Disable it for a faithful v6-policy reproduction; fixed-goal evaluation
+    # and replay diagnostics still gate completion as they did in v6.
+    field_false_free_audit_enabled: false
+    field_false_free_audit_samples: 1024
+    field_false_free_audit_goals_per_state: 4
+    field_false_free_target_speed_max: 0.20
+    field_false_free_pred_speed_min: 0.20
+    field_false_free_max_rate: 0.05
+    field_false_free_min_low_states: 32
     debug_point_cloud_topic: /debug/points/world
     planned_path_topic: /ur_mntfields_arm/planned_path
     replan_while_executing: false
     trajectory_busy_margin_s: 0.25
     trajectory_max_joint_speed: 0.15
     trajectory_min_segment_dt: 0.55
+    trajectory_collision_margin_m: 0.02
     trajectory_waypoint_stride: 3
     trajectory_smoothing_window: 5
-    execute_prefix_waypoints: 40
-    execute_prefix_min_duration_s: 8.0
+    # Zero executes the entire collision-validated plan, so NBV observations
+    # are taken at the post-IK pose that was scored rather than a transit pose.
+    execute_prefix_waypoints: 0
+    execute_prefix_min_duration_s: 0.0
     enable_frontier_roi_filter: true
     enable_object_roi_nbv: true
     object_roi_nbv_first: true
+    # A valid ROI view is already a verified cabinet observation. Defer the
+    # broader frontier sweep until ROI NBV cannot produce a goal.
     rank_frontiers_when_roi_available: false
     fast_roi_nbv: true
     roi_nbv_max_pose_candidates: 18
     enable_view_self_occlusion_filter: true
-    min_view_self_occlusion_free_fraction: 0.80
+    min_view_self_occlusion_free_fraction: 0.85
     view_self_occlusion_padding_m: 0.03
-    min_frontier_visibility_score: 0.0
-    min_roi_coverage_ratio: 0.0
-    min_view_alignment: 0.60
+    view_self_occlusion_ignore_near_origin_m: 0.06
+    min_frontier_visibility_score: 0.005
+    min_roi_coverage_ratio: 0.005
+    min_view_alignment: 0.50
+    min_actual_view_alignment: 0.75
+    # Bound fallback scoring and spread its small budget across cabinet faces.
+    frontier_pose_candidates_per_frontier: 6
+    frontier_fallback_max_frontiers: 6
     frontier_roi_init_min_points: 300
     frontier_roi_init_min_step: 1
     frontier_roi_padding_xyz: [0.12, 0.12, 0.12]
@@ -187,24 +266,45 @@ arm_mntfields_explorer:
       - "0.84,0.35,0.90,0.24,1.32,0.02"
       - "0.84,0.35,1.34,0.24,1.32,0.02"
     scene_boxes_frame: world
+    # The pedestal is static collision geometry, but is separate from the
+    # cabinet ROI so it cannot bias ROI coverage or unknown-space gain.
+    support_boxes:
+      - "0.15,0.35,0.25,0.55,0.55,0.50"
+    support_boxes_frame: world
+    # Depth voxels on the pedestal are represented by the analytic support
+    # box. Ignore a few voxel cells around it to avoid pinning the bolted
+    # shoulder contact to a spurious low point-cloud clearance.
+    support_point_ignore_padding_m: 0.15
     cabinet_bbox_padding_xyz: [0.04, 0.04, 0.04]
     roi_clip_frame: world
     roi_clip_min_xyz: [-10.0, -10.0, 0.55]
     roi_clip_max_xyz: [10.0, 10.0, 10.0]
-    finish_when_frontiers_exhausted: true
-    finish_when_roi_covered: true
-    finish_when_field_eval_passes: false
+    finish_when_frontiers_exhausted: false
+    finish_when_roi_covered: false
+    finish_when_field_eval_passes: true
     roi_coverage_threshold: 0.82
     roi_unknown_stop_voxels: 40
     field_eval_points_frame: world
     field_eval_points_xyz: [0.60, 0.35, 0.68, 0.60, 0.35, 1.12, 0.78, 0.35, 0.68, 0.78, 0.35, 1.12]
+    # Deterministic certification goals shared with the field-test launch.
+    # These avoid making network certification contingent on an expensive,
+    # orientation-sensitive online IK sweep.
+    field_eval_joint_goals: [
+      1.23185, -3.07826, 0.72136, -0.59385, -2.83020, 0.15120,
+      0.40184, -2.96287, 1.10643, -1.37075, -1.97805, -0.01827,
+      0.13576, -1.74602, 0.05562, -1.70421, -2.25075, -0.14848,
+    ]
     field_eval_goal_clearance_min_m: 0.05
     field_eval_goal_tool_forward_alignment_min: 0.70
     field_eval_success_ratio_threshold: 1.0
-    field_eval_every_n_steps: 1
+    field_eval_every_n_steps: 10
     field_eval_min_train_steps: 1000
     field_eval_min_replay_pairs: 12000
     field_eval_use_startup_pose: true
+    # Certification intentionally evaluates a raw field rollout, while normal
+    # exploration remains collision-aware until a newly trained field passes.
+    field_eval_collision_aware_rollout: false
+    training_wall_time_limit_s: 600.0
     goal_tool_orientation_yaw_offsets_rad: [0.0, 1.5708, -1.5708, 3.1416]
     goal_tool_orientation_pitch_offsets_rad: [0.0, 0.7854, -0.7854, 1.5708, -1.5708]
     goal_tool_orientation_roll_offsets_rad: [0.0, 1.5708, -1.5708, 3.1416]
@@ -218,4 +318,7 @@ arm_mntfields_explorer:
     startup_wait_log_interval_s: 2.0
     startup_data_collection_delay_s: 6.0
     strict_train_move_cycle: false
-    train_during_motion: true
+    # Sampling/training is synchronous in the explorer callback. Do it after
+    # the commanded view is reached so joint/camera state cannot go stale
+    # while a long clearance query is running.
+    train_during_motion: false

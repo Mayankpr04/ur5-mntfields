@@ -21,6 +21,7 @@ class Model:
         lr: float = 1e-4,
         td_loss_weight: float = 1.0e-3,
         speed_loss_weight: float = 1.0e-2,
+        log_speed_loss_weight: float = 0.0,
         direct_speed_loss_weight: float = 0.0,
         normal_loss_weight: float = 1.0e-3,
         normal_cos_loss_weight: float = 0.0,
@@ -69,6 +70,7 @@ class Model:
         self.loss_config = {
             "td_loss_weight": float(td_loss_weight),
             "speed_loss_weight": float(speed_loss_weight),
+            "log_speed_loss_weight": float(log_speed_loss_weight),
             "direct_speed_loss_weight": float(direct_speed_loss_weight),
             "normal_loss_weight": float(normal_loss_weight),
             "normal_cos_loss_weight": float(normal_cos_loss_weight),
@@ -125,35 +127,49 @@ class Model:
         self.function = None
         self.optimizer = None
 
-    def train_batch(self, batch_data: torch.Tensor):
+    def _batch_loss(self, data: torch.Tensor, beta: float):
+        points = data[:, : 2 * self.dim].float()
+        speed = torch.clamp(data[:, 2 * self.dim : 2 * self.dim + 2].float(), min=0.0, max=1.0)
+        normal = data[:, 2 * self.dim + 2 :].float()
+        return self.function.Loss(points, speed, normal, beta, gamma=0.001, epoch=self.epoch)
+
+    def train_batch(self, batch_data: torch.Tensor, accumulation_steps: int = 1):
         if batch_data is None or len(batch_data) == 0:
             return None
         if self.optimizer is None or self.network is None or self.function is None:
             return None
 
         data = batch_data.to(self.device)
-        points = data[:, : 2 * self.dim].float()
-        speed = data[:, 2 * self.dim : 2 * self.dim + 2].float()
-        normal = data[:, 2 * self.dim + 2 :].float()
-
-        speed = speed * speed * (2 - speed) * (2 - speed)
-        if hasattr(self, "alpha"):
-            speed = self.alpha * speed + 1 - self.alpha
-
-        gamma = 0.001
+        # Keep the optimizer objective stationary.  Scaling each update by the
+        # inverse of the previous raw loss made one large early loss suppress
+        # every subsequent gradient (the direct-speed auxiliary can be very
+        # large while the randomly initialized time gradient is near zero).
+        # AdamW already normalizes update magnitudes; the paper's online
+        # training also optimizes Eq. 12 directly without this feedback term.
         beta = 1.0
-        if math.isfinite(getattr(self, "last_loss", 1.0)):
-            beta = 1.0 / max(float(self.last_loss), 1e-3)
 
         self.network.train(True)
         self.optimizer.zero_grad(set_to_none=True)
-        loss_value, loss_n, _wv = self.function.Loss(
-            points, speed, normal, beta, gamma, self.epoch
-        )
-        loss_value.backward()
+        total_rows = int(len(data))
+        chunks = max(1, min(int(accumulation_steps), total_rows))
+        base = total_rows // chunks
+        remainder = total_rows % chunks
+        start = 0
+        weighted_loss_n = 0.0
+        for chunk_idx in range(chunks):
+            chunk_size = base + (1 if chunk_idx < remainder else 0)
+            if chunk_size <= 0:
+                continue
+            end = start + chunk_size
+            loss_value, loss_n, _wv = self._batch_loss(data[start:end], beta)
+            # This is equivalent to one batch loss while keeping each
+            # second-derivative graph bounded by the CUDA microbatch size.
+            (loss_value * (float(chunk_size) / float(total_rows))).backward()
+            weighted_loss_n += float(loss_n.detach().item()) * float(chunk_size)
+            start = end
         self.optimizer.step()
         self.epoch += 1
-        self.last_loss = float(loss_n.detach().item())
+        self.last_loss = weighted_loss_n / float(total_rows)
         return self.last_loss
 
     def train_core(self, epoch, frame_data=None, is_one_frame=True):
@@ -207,9 +223,7 @@ class Model:
                     speed = data[:, 2 * self.dim : 2 * self.dim + 2].float()
                     normal = data[:, 2 * self.dim + 2 :].float()
 
-                    speed = speed * speed * (2 - speed) * (2 - speed)
-                    if hasattr(self, "alpha"):
-                        speed = self.alpha * speed + 1 - self.alpha
+                    speed = torch.clamp(speed, min=0.0, max=1.0)
 
                     gamma = 0.001
                     loss_value, loss_n, _wv = self.function.Loss(

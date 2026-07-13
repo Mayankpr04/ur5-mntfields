@@ -24,10 +24,11 @@ class ArmFieldModel:
         replay_capacity: int = 50000,
         minibatch_size: int = 512,
         replay_ratio: float = 0.75,
-        replay_cell_width: float = 0.20,
-        replay_clearance_bins: int = 4,
+        priority_ratio: float = 0.0,
+        gradient_accumulation_steps: int = 1,
         td_loss_weight: float = 1.0e-3,
         speed_loss_weight: float = 1.0e-2,
+        log_speed_loss_weight: float = 0.0,
         direct_speed_loss_weight: float = 0.0,
         normal_loss_weight: float = 1.0e-3,
         normal_cos_loss_weight: float = 0.0,
@@ -43,6 +44,7 @@ class ArmFieldModel:
         self.loss_config = {
             "td_loss_weight": float(td_loss_weight),
             "speed_loss_weight": float(speed_loss_weight),
+            "log_speed_loss_weight": float(log_speed_loss_weight),
             "direct_speed_loss_weight": float(direct_speed_loss_weight),
             "normal_loss_weight": float(normal_loss_weight),
             "normal_cos_loss_weight": float(normal_cos_loss_weight),
@@ -67,14 +69,13 @@ class ArmFieldModel:
         self.last_checkpoint_epoch = 0
         self.replay_capacity = max(1, int(replay_capacity))
         self.minibatch_size = max(1, int(minibatch_size))
+        self.gradient_accumulation_steps = max(1, int(gradient_accumulation_steps))
+        self.effective_minibatch_size = self.minibatch_size * self.gradient_accumulation_steps
         self.replay_ratio = float(np.clip(replay_ratio, 0.0, 1.0))
-        self.replay_cell_width = float(max(1.0e-3, replay_cell_width))
-        self.replay_clearance_bins = max(1, int(replay_clearance_bins))
+        self.priority_ratio = float(np.clip(priority_ratio, 0.0, 0.75))
         self.replay_buffer: np.ndarray | None = None
         self.replay_size = 0
         self.replay_insert_idx = 0
-        self.replay_order: np.ndarray | None = None
-        self.replay_cursor = 0
         self.last_train_batch_size = 0
         self.last_train_pair_count = 0
         self.last_diagnostics: dict[str, float] = {}
@@ -92,63 +93,9 @@ class ArmFieldModel:
         rows = np.asarray(merged, dtype=np.float32)
         if rows.ndim != 2 or len(rows) <= max_rows:
             return rows
-
-        q0 = rows[:, :6]
-        q1 = rows[:, 6:12]
-        mid = 0.5 * (q0 + q1)
-        speeds = np.clip(rows[:, 12:14], 0.0, 1.0)
-        clearance_proxy = np.min(speeds, axis=1)
-        risk = 1.0 - clearance_proxy
-
-        cell = float(self.replay_cell_width)
-        mid_bins = np.floor((mid + 0.5) / cell).astype(np.int32)
-        risk_bins = np.clip(
-            np.floor(risk * float(self.replay_clearance_bins)).astype(np.int32),
-            0,
-            self.replay_clearance_bins - 1,
-        )
-
-        keys = np.concatenate((mid_bins, risk_bins[:, None]), axis=1).astype(np.int32, copy=False)
-        uniq, inv = np.unique(keys, axis=0, return_inverse=True)
-        if len(inv) != len(rows):
-            idx = np.random.choice(len(rows), max_rows, replace=False)
-            return rows[idx]
-        n_bins = int(len(uniq))
-        if n_bins <= 0:
-            idx = np.random.choice(len(rows), max_rows, replace=False)
-            return rows[idx]
-
-        base_quota = max(1, max_rows // n_bins)
-        chosen: list[int] = []
-        chosen_mask = np.zeros(len(rows), dtype=bool)
-
-        # Newer rows get higher retention weight once the buffer is saturated.
-        recency = np.arange(len(rows), dtype=np.float64) + 1.0
-
-        for bi in range(n_bins):
-            inds = np.where(inv == bi)[0]
-            if len(inds) <= base_quota:
-                pick = inds
-            else:
-                w = recency[inds]
-                w = w / np.maximum(w.sum(), 1.0e-12)
-                pick = np.random.choice(inds, base_quota, replace=False, p=w)
-            chosen.extend(np.asarray(pick, dtype=np.int64).tolist())
-            chosen_mask[np.asarray(pick, dtype=np.int64)] = True
-
-        if len(chosen) < max_rows:
-            remaining = np.where(~chosen_mask)[0]
-            fill = min(max_rows - len(chosen), len(remaining))
-            if fill > 0:
-                w = recency[remaining]
-                w = w / np.maximum(w.sum(), 1.0e-12)
-                extra = np.random.choice(remaining, fill, replace=False, p=w)
-                chosen.extend(np.asarray(extra, dtype=np.int64).tolist())
-
-        if len(chosen) > max_rows:
-            chosen = np.random.choice(np.asarray(chosen, dtype=np.int64), max_rows, replace=False).tolist()
-
-        idx = np.asarray(chosen, dtype=np.int64)
+        # Algorithm 1 retains and samples memory uniformly. Clearance/cell
+        # quotas distort the empirical speed distribution toward obstacles.
+        idx = np.random.choice(len(rows), int(max_rows), replace=False)
         return rows[idx].astype(np.float32, copy=False)
 
     def add_rows(self, frame_data: np.ndarray):
@@ -168,93 +115,77 @@ class ArmFieldModel:
         self.replay_buffer[:keep] = merged
         self.replay_size = keep
         self.replay_insert_idx = keep % self.replay_capacity
-        self.replay_order = None
-        self.replay_cursor = 0
 
-    def _shuffle_replay_order(self):
-        if self.replay_size <= 0:
-            self.replay_order = None
-            self.replay_cursor = 0
-            return
-        self.replay_order = np.random.permutation(self.replay_size)
-        self.replay_cursor = 0
+    def _sample_rows_random(self, rows: np.ndarray, count: int) -> np.ndarray:
+        """Uniformly sample labelled states as specified by Algorithm 1."""
+        data = np.asarray(rows, dtype=np.float32)
+        count = max(0, int(count))
+        if data.ndim != 2 or len(data) == 0 or count <= 0:
+            width = int(data.shape[1]) if data.ndim == 2 else 26
+            return np.zeros((0, width), dtype=np.float32)
+        take = min(count, len(data))
+        idx = np.random.choice(len(data), size=take, replace=False)
+        return data[idx].astype(np.float32, copy=False)
 
     def _sample_replay_rows(self, count: int) -> np.ndarray:
         if self.replay_buffer is None or self.replay_size <= 0 or count <= 0:
             return np.zeros((0, 26), dtype=np.float32)
-        out = []
-        remaining = int(count)
-        while remaining > 0:
-            if self.replay_order is None or len(self.replay_order) != self.replay_size or self.replay_cursor >= self.replay_size:
-                self._shuffle_replay_order()
-                if self.replay_order is None:
-                    break
-            take = min(remaining, self.replay_size - self.replay_cursor)
-            idx = self.replay_order[self.replay_cursor : self.replay_cursor + take]
-            out.append(self.replay_buffer[idx])
-            self.replay_cursor += take
-            remaining -= take
-        if not out:
-            return np.zeros((0, 26), dtype=np.float32)
-        return np.concatenate(out, axis=0).astype(np.float32, copy=False)
+        return self._sample_rows_random(self.replay_buffer[: self.replay_size], int(count))
 
-    def sample_training_batch(self, frame_data: np.ndarray) -> np.ndarray:
+    def sample_training_batch(
+        self,
+        frame_data: np.ndarray,
+        priority_rows: np.ndarray | None = None,
+    ) -> np.ndarray:
         frame_rows = np.asarray(frame_data, dtype=np.float32)
+        batch_size = self.effective_minibatch_size
+        priority = (
+            np.asarray(priority_rows, dtype=np.float32)
+            if priority_rows is not None
+            else np.zeros((0, frame_rows.shape[1] if frame_rows.ndim == 2 else 26), dtype=np.float32)
+        )
+        if priority.ndim != 2 or (frame_rows.ndim == 2 and priority.shape[1] != frame_rows.shape[1]):
+            priority = np.zeros((0, frame_rows.shape[1] if frame_rows.ndim == 2 else 26), dtype=np.float32)
+        priority_count = min(
+            len(priority),
+            max(0, int(round(batch_size * self.priority_ratio))),
+        )
+        priority_batch = self._sample_rows_random(priority, priority_count)
+        ordinary_batch_size = max(0, batch_size - len(priority_batch))
+        if ordinary_batch_size <= 0:
+            return priority_batch
         if frame_rows.ndim != 2 or len(frame_rows) == 0:
-            return self._sample_replay_rows(min(self.minibatch_size, self.replay_size))
+            ordinary = self._sample_replay_rows(min(ordinary_batch_size, self.replay_size))
+            return self._merge_sample_parts(priority_batch, ordinary)
 
         if self.replay_size <= 0:
-            if len(frame_rows) <= self.minibatch_size:
-                return frame_rows
-            idx = np.random.choice(len(frame_rows), size=self.minibatch_size, replace=False)
-            return frame_rows[idx]
+            ordinary = self._sample_rows_random(frame_rows, ordinary_batch_size)
+            return self._merge_sample_parts(priority_batch, ordinary)
 
-        new_count = min(len(frame_rows), max(1, int(round(self.minibatch_size * (1.0 - self.replay_ratio)))))
-        replay_count = max(0, self.minibatch_size - new_count)
+        new_count = min(
+            len(frame_rows),
+            max(1, int(round(ordinary_batch_size * (1.0 - self.replay_ratio)))),
+        )
+        replay_count = max(0, ordinary_batch_size - new_count)
 
         if len(frame_rows) <= new_count:
             frame_batch = frame_rows
         else:
-            idx = np.random.choice(len(frame_rows), size=new_count, replace=False)
-            frame_batch = frame_rows[idx]
+            frame_batch = self._sample_rows_random(frame_rows, new_count)
 
         replay_batch = self._sample_replay_rows(replay_count)
-        if len(replay_batch) == 0:
-            return frame_batch
-        if len(frame_batch) == 0:
-            return replay_batch
-        batch = np.concatenate((frame_batch, replay_batch), axis=0).astype(np.float32, copy=False)
+        ordinary = self._merge_sample_parts(frame_batch, replay_batch)
+        return self._merge_sample_parts(priority_batch, ordinary)
+
+    @staticmethod
+    def _merge_sample_parts(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+        if len(first) == 0:
+            return second
+        if len(second) == 0:
+            return first
+        batch = np.concatenate((first, second), axis=0).astype(np.float32, copy=False)
         order = np.random.permutation(len(batch))
         return batch[order]
-
-    def _iter_training_batches(self, frame_data: np.ndarray):
-        frame_rows = np.asarray(frame_data, dtype=np.float32)
-        if frame_rows.ndim != 2 or len(frame_rows) == 0:
-            replay_batch = self._sample_replay_rows(min(self.minibatch_size, self.replay_size))
-            if len(replay_batch):
-                yield replay_batch
-            return
-
-        if self.replay_size <= 0:
-            order = np.random.permutation(len(frame_rows))
-            for start in range(0, len(order), self.minibatch_size):
-                idx = order[start : start + self.minibatch_size]
-                if len(idx):
-                    yield frame_rows[idx]
-            return
-
-        new_count = min(len(frame_rows), max(1, int(round(self.minibatch_size * (1.0 - self.replay_ratio)))))
-        replay_count = max(0, self.minibatch_size - new_count)
-        order = np.random.permutation(len(frame_rows))
-        for start in range(0, len(order), new_count):
-            idx = order[start : start + new_count]
-            frame_batch = frame_rows[idx]
-            replay_batch = self._sample_replay_rows(replay_count)
-            if len(replay_batch) == 0:
-                yield frame_batch
-                continue
-            batch = np.concatenate((frame_batch, replay_batch), axis=0).astype(np.float32, copy=False)
-            yield batch[np.random.permutation(len(batch))]
 
     def build_pair_batch(self, state_batch: np.ndarray) -> np.ndarray:
         rows = np.asarray(state_batch, dtype=np.float32)
@@ -279,6 +210,35 @@ class ArmFieldModel:
         y1 = rows[1::2, 6:7]
         n1 = rows[1::2, 7:]
         return np.concatenate((q0, q1, y0, y1, n0, n1), axis=1).astype(np.float32, copy=False)
+
+    @staticmethod
+    def reshuffle_pair_endpoints(pair_rows: np.ndarray) -> np.ndarray:
+        """Re-form start/goal pairs from independently labelled states.
+
+        Algorithm 1 stores individual C-space samples in memory and shuffles
+        them into new start/goal pairs for every optimizer iteration.  Online
+        sampling naturally emits 26-column local pairs, so leaving those pairs
+        intact over-represents short displacements and does not teach the
+        global time field.  This conversion preserves every configuration,
+        speed label, and normal while randomizing only the pairing.
+        """
+        rows = np.asarray(pair_rows, dtype=np.float32)
+        if rows.ndim != 2 or rows.shape[1] != 26 or len(rows) < 2:
+            return rows.astype(np.float32, copy=False)
+        states = np.concatenate(
+            (
+                np.concatenate((rows[:, :6], rows[:, 12:13], rows[:, 14:20]), axis=1),
+                np.concatenate((rows[:, 6:12], rows[:, 13:14], rows[:, 20:26]), axis=1),
+            ),
+            axis=0,
+        ).astype(np.float32, copy=False)
+        states = states[np.random.permutation(len(states))]
+        s0 = states[0::2]
+        s1 = states[1::2]
+        return np.concatenate(
+            (s0[:, :6], s1[:, :6], s0[:, 6:7], s1[:, 6:7], s0[:, 7:], s1[:, 7:]),
+            axis=1,
+        ).astype(np.float32, copy=False)
 
     def recombine_replay_pairs(self, count: int) -> np.ndarray:
         if self.replay_buffer is None or self.replay_size <= 0 or count <= 0:
@@ -312,23 +272,52 @@ class ArmFieldModel:
         s1 = s1[keep]
         return np.concatenate((s0[:, :6], s1[:, :6], s0[:, 6:7], s1[:, 6:7], s0[:, 7:], s1[:, 7:]), axis=1).astype(np.float32, copy=False)
 
-    def train_step(self, frame_data: np.ndarray, epochs: int) -> float | None:
-        if frame_data.size == 0:
+    def train_step(
+        self,
+        frame_data: np.ndarray,
+        epochs: int,
+        transient_rows: np.ndarray | None = None,
+        priority_rows: np.ndarray | None = None,
+    ) -> float | None:
+        persistent_rows = np.asarray(frame_data, dtype=np.float32)
+        transient = (
+            np.asarray(transient_rows, dtype=np.float32)
+            if transient_rows is not None
+            else np.zeros((0, persistent_rows.shape[1] if persistent_rows.ndim == 2 else 26), dtype=np.float32)
+        )
+        if persistent_rows.ndim != 2:
+            persistent_rows = np.zeros((0, 26), dtype=np.float32)
+        if transient.ndim != 2 or (len(persistent_rows) and transient.shape[1] != persistent_rows.shape[1]):
+            transient = np.zeros((0, persistent_rows.shape[1]), dtype=np.float32)
+        if len(persistent_rows) == 0 and len(transient) == 0:
             return None
-        self.add_rows(frame_data)
+        # Synthetic random pairs improve conditioning for this optimizer pass,
+        # but they are not newly collision-labelled states. Keep them out of
+        # the long-lived replay buffer so they cannot recursively dominate it.
+        if len(persistent_rows):
+            self.add_rows(persistent_rows)
+        training_rows = (
+            np.concatenate((persistent_rows, transient), axis=0).astype(np.float32, copy=False)
+            if len(transient)
+            else persistent_rows
+        )
         train_steps = max(1, int(epochs))
         last_loss = None
         for _ in range(train_steps):
-            state_batch = self.sample_training_batch(frame_data)
+            state_batch = self.sample_training_batch(training_rows, priority_rows=priority_rows)
             if state_batch.size == 0:
                 continue
             self.last_train_batch_size = int(len(state_batch))
             pair_batch = self.build_pair_batch(state_batch)
+            pair_batch = self.reshuffle_pair_endpoints(pair_batch)
             self.last_train_pair_count = int(len(pair_batch))
             if pair_batch.size == 0:
                 continue
             batch_t = torch.from_numpy(pair_batch).float().to(self.device)
-            last_loss = self.model.train_batch(batch_t)
+            last_loss = self.model.train_batch(
+                batch_t,
+                accumulation_steps=self.gradient_accumulation_steps,
+            )
             if last_loss is None:
                 continue
         self.total_epochs_trained += train_steps
@@ -338,8 +327,7 @@ class ArmFieldModel:
 
     @staticmethod
     def _training_speed_target(raw_speed: np.ndarray) -> np.ndarray:
-        speed = np.clip(np.asarray(raw_speed, dtype=np.float32), 0.0, 1.0)
-        return speed * speed * (2.0 - speed) * (2.0 - speed)
+        return np.clip(np.asarray(raw_speed, dtype=np.float32), 0.0, 1.0)
 
     def predict_normalized_pair_speeds(
         self,
@@ -368,9 +356,10 @@ class ArmFieldModel:
             xp = torch.from_numpy(xp_np).float().to(self.device)
             xp.requires_grad_(True)
             tau, _w, xp_grad = self.model.network.out(xp)
-            dtau = self.model.function.gradient(tau, xp_grad, create_graph=False)
-            dt0 = dtau[:, : self.dim]
-            dt1 = dtau[:, self.dim :]
+            arrival_time = self.model.function.arrival_time(tau, xp_grad)
+            dtime = self.model.function.gradient(arrival_time, xp_grad, create_graph=False)
+            dt0 = dtime[:, : self.dim]
+            dt1 = dtime[:, self.dim :]
             pred0 = torch.rsqrt(torch.sum(dt0 * dt0, dim=1) + 1.0e-8)
             pred1 = torch.rsqrt(torch.sum(dt1 * dt1, dim=1) + 1.0e-8)
             pred0_parts.append(pred0.detach().cpu().numpy().astype(np.float32))
@@ -423,9 +412,10 @@ class ArmFieldModel:
             xp = torch.from_numpy(batch).float().to(self.device)
             xp.requires_grad_(True)
             tau, _w, xp_grad = self.model.network.out(xp)
-            dtau = self.model.function.gradient(tau, xp_grad, create_graph=False)
-            dt0 = dtau[:, : self.dim]
-            dt1 = dtau[:, self.dim :]
+            arrival_time = self.model.function.arrival_time(tau, xp_grad)
+            dtime = self.model.function.gradient(arrival_time, xp_grad, create_graph=False)
+            dt0 = dtime[:, : self.dim]
+            dt1 = dtime[:, self.dim :]
             pred0 = torch.rsqrt(torch.sum(dt0 * dt0, dim=1) + 1.0e-8)
             pred1 = torch.rsqrt(torch.sum(dt1 * dt1, dim=1) + 1.0e-8)
             pred0_parts.append(pred0.detach().cpu().numpy().astype(np.float32))
@@ -453,16 +443,35 @@ class ArmFieldModel:
             return 0.0
         return float(np.corrcoef(a, b)[0, 1])
 
-    def evaluate_replay_diagnostics(self, max_rows: int = 4096) -> dict[str, float]:
-        rows = self._valid_replay_rows()
+    def evaluate_replay_diagnostics(
+        self,
+        max_rows: int = 4096,
+        *,
+        rows: np.ndarray | None = None,
+        prediction: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None,
+    ) -> dict[str, float]:
+        if rows is None:
+            # Training independently reshuffles labelled endpoints on every
+            # update. Saved sampler rows are intentionally local and critical
+            # rows may even repeat q0 as q1. Evaluating those original pairs
+            # confounds clearance with pair distance and made a good field
+            # appear inversely correlated. Match the optimizer distribution.
+            rows = self.reshuffle_pair_endpoints(self._valid_replay_rows())
+        else:
+            rows = np.asarray(rows, dtype=np.float32)
         if rows.ndim != 2 or rows.shape[1] != 26 or len(rows) == 0:
             return {"diag_rows": 0.0}
-        if len(rows) > max_rows:
+        # A supplied prediction is aligned with these exact rows. Do not
+        # resample it underneath the caller and silently mix array lengths.
+        if len(rows) > max_rows and prediction is None:
             idx = np.random.choice(len(rows), int(max_rows), replace=False)
             rows = rows[idx]
         raw_speed = np.clip(rows[:, 12:14], 0.0, 1.0)
         target = self._training_speed_target(raw_speed)
-        pred0, pred1, dt0, dt1 = self._predict_replay_gradients(rows)
+        if prediction is None:
+            pred0, pred1, dt0, dt1 = self._predict_replay_gradients(rows)
+        else:
+            pred0, pred1, dt0, dt1 = prediction
         pred = np.stack((pred0, pred1), axis=1)
         pred_clip = np.clip(pred, 0.0, 2.0)
         target_flat = target.reshape(-1)
@@ -485,11 +494,18 @@ class ArmFieldModel:
         cos0 = np.sum((-dt0 / np.maximum(dt0_norm, 1.0e-8)) * normals0, axis=1)
         cos1 = np.sum((-dt1 / np.maximum(dt1_norm, 1.0e-8)) * normals1, axis=1)
         raw_flat = raw_speed.reshape(-1)
+        low_target_threshold = 0.20
+        low_pred_max = float(self.loss_config.get("low_speed_pred_max", 0.35))
         near = raw_flat <= np.quantile(raw_flat, 0.25) if len(raw_flat) >= 4 else raw_flat <= 0.25
         far = raw_flat >= np.quantile(raw_flat, 0.75) if len(raw_flat) >= 4 else raw_flat >= 0.75
         near_pred = pred_flat[near] if np.any(near) else np.zeros((0,), dtype=np.float32)
         far_pred = pred_flat[far] if np.any(far) else np.zeros((0,), dtype=np.float32)
-        near_cos = np.concatenate((cos0[raw_speed[:, 0] <= 0.35], cos1[raw_speed[:, 1] <= 0.35]))
+        near_cos = np.concatenate(
+            (
+                cos0[raw_speed[:, 0] <= low_target_threshold],
+                cos1[raw_speed[:, 1] <= low_target_threshold],
+            )
+        )
         diag = {
             "diag_rows": float(len(rows)),
             "speed_mae": float(np.mean(np.abs(pred_flat - target_flat))),
@@ -506,8 +522,13 @@ class ArmFieldModel:
             "grad_goal_cos_median": float(np.median(grad_goal_cos)) if len(grad_goal_cos) else 0.0,
             "grad_goal_neg_frac": float(np.mean(grad_goal_cos < 0.0)) if len(grad_goal_cos) else 0.0,
             "pred_nonfinite_frac": float(np.mean(~np.isfinite(pred_flat))),
-            "low_target_overpred_frac": float(np.mean(pred_flat[raw_flat <= 0.10] > 0.35)) if np.any(raw_flat <= 0.10) else 0.0,
-            "low_target_count": float(np.count_nonzero(raw_flat <= 0.10)),
+            "low_target_threshold": low_target_threshold,
+            "low_target_overpred_frac": float(
+                np.mean(pred_flat[raw_flat <= low_target_threshold] > low_pred_max)
+            )
+            if np.any(raw_flat <= low_target_threshold)
+            else 0.0,
+            "low_target_count": float(np.count_nonzero(raw_flat <= low_target_threshold)),
         }
         self.last_diagnostics = diag
         return diag
@@ -521,8 +542,9 @@ class ArmFieldModel:
         q_start: np.ndarray | None = None,
         max_rows: int = 4096,
         grid_size: int = 61,
+        include_joint_slices: bool = True,
     ) -> list[Path]:
-        rows = self._valid_replay_rows()
+        rows = self.reshuffle_pair_endpoints(self._valid_replay_rows())
         if rows.ndim != 2 or rows.shape[1] != 26 or len(rows) == 0:
             return []
         out_dir = Path(output_dir)
@@ -535,7 +557,13 @@ class ArmFieldModel:
         pred0, pred1, dt0, dt1 = self._predict_replay_gradients(rows)
         pred = np.clip(np.stack((pred0, pred1), axis=1), 0.0, 2.0)
         saved: list[Path] = []
-        diag = self.evaluate_replay_diagnostics(max_rows=max_rows)
+        # Reuse the gradient pass already required for the plots. Running a
+        # second full autograd diagnostic here doubled checkpoint overhead.
+        diag = self.evaluate_replay_diagnostics(
+            max_rows=max_rows,
+            rows=rows,
+            prediction=(pred0, pred1, dt0, dt1),
+        )
         summary_path = out_dir / f"diagnostic_summary_{step_label}.json"
         summary_path.write_text(json.dumps(diag, indent=2, sort_keys=True), encoding="utf-8")
         saved.append(summary_path)
@@ -544,7 +572,7 @@ class ArmFieldModel:
         ax.scatter(target.reshape(-1), pred.reshape(-1), s=5, alpha=0.35, c=raw_speed.reshape(-1), cmap="turbo")
         ax.plot([0.0, 1.0], [0.0, 1.0], color="black", linewidth=1.0)
         ax.set_xlabel("target speed used by loss")
-        ax.set_ylabel("predicted speed = 1 / ||grad tau||")
+        ax.set_ylabel("predicted speed = 1 / ||grad T||")
         ax.set_title(
             f"Replay Speed Fit {step_label}\n"
             f"MAE={diag.get('speed_mae', 0.0):.3f}, corr={diag.get('speed_corr', 0.0):.3f}, "
@@ -583,15 +611,16 @@ class ArmFieldModel:
         plt.close(fig)
         saved.append(path)
 
-        if q_start is not None and np.all(np.isfinite(q_start)):
-            q0n = kinematics.normalize(np.asarray(q_start, dtype=np.float64)).astype(np.float32)
-        else:
-            q0n = rows[0, :6].astype(np.float32)
-        q1n = rows[int(np.argmax(np.max(np.abs(rows[:, 6:12] - q0n[None, :]), axis=1))), 6:12].astype(np.float32)
-        for ji, jj in ((0, 1), (1, 2), (2, 3), (3, 4)):
-            path = self._save_joint_slice_plot(out_dir, step_label, q0n, q1n, ji, jj, int(grid_size))
-            if path is not None:
-                saved.append(path)
+        if include_joint_slices:
+            if q_start is not None and np.all(np.isfinite(q_start)):
+                q0n = kinematics.normalize(np.asarray(q_start, dtype=np.float64)).astype(np.float32)
+            else:
+                q0n = rows[0, :6].astype(np.float32)
+            q1n = rows[int(np.argmax(np.max(np.abs(rows[:, 6:12] - q0n[None, :]), axis=1))), 6:12].astype(np.float32)
+            for ji, jj in ((0, 1), (1, 2), (2, 3), (3, 4)):
+                path = self._save_joint_slice_plot(out_dir, step_label, q0n, q1n, ji, jj, int(grid_size))
+                if path is not None:
+                    saved.append(path)
         return saved
 
     def _save_joint_slice_plot(
@@ -633,16 +662,17 @@ class ArmFieldModel:
         xpt = torch.from_numpy(xp).float().to(self.device)
         xpt.requires_grad_(True)
         tau, _w, xpg = self.model.network.out(xpt)
-        dtau = self.model.function.gradient(tau, xpg, create_graph=False)
-        dt0 = dtau[:, : self.dim]
+        arrival_time = self.model.function.arrival_time(tau, xpg)
+        dtime = self.model.function.gradient(arrival_time, xpg, create_graph=False)
+        dt0 = dtime[:, : self.dim]
         pred_speed = torch.rsqrt(torch.sum(dt0 * dt0, dim=1) + 1.0e-8).detach().cpu().numpy().reshape(grid_size, grid_size)
-        tau_np = tau.detach().cpu().numpy().reshape(grid_size, grid_size)
+        time_np = arrival_time.detach().cpu().numpy().reshape(grid_size, grid_size)
         self.model.network.train(was_training)
         rollout = self.gradient_rollout(center, goal, step_size=0.03, max_steps=180, tol=0.01)
         if rollout.ndim != 2 or rollout.shape[1] != self.dim:
             rollout = np.zeros((0, self.dim), dtype=np.float32)
         fig, axes = plt.subplots(1, 2, figsize=(12.0, 5.4))
-        c0 = axes[0].contourf(xs, ys, tau_np, levels=28, cmap="viridis")
+        c0 = axes[0].contourf(xs, ys, time_np, levels=28, cmap="viridis")
         c1 = axes[1].contourf(xs, ys, np.clip(pred_speed, 0.0, 1.0), levels=28, cmap="turbo", vmin=0.0, vmax=1.0)
         for ax in axes:
             ax.scatter([center[ji]], [center[jj]], c="lime", s=70, label="start")
@@ -668,10 +698,10 @@ class ArmFieldModel:
             ax.set_xlabel(f"q{ji} normalized")
             ax.set_ylabel(f"q{jj} normalized")
             ax.grid(alpha=0.2)
-        axes[0].set_title("tau contour, 2D cut through 6D")
+        axes[0].set_title("factorized T contour, 2D cut through 6D")
         axes[1].set_title("predicted speed contour, same 2D cut")
         axes[1].legend(loc="upper right")
-        fig.colorbar(c0, ax=axes[0], label="tau")
+        fig.colorbar(c0, ax=axes[0], label="T")
         fig.colorbar(c1, ax=axes[1], label="pred speed")
         path = out_dir / f"field_slice_{step_label}_{ji}_{jj}.png"
         fig.tight_layout()
@@ -687,6 +717,9 @@ class ArmFieldModel:
                 "network_state_dict": self.model.network.state_dict(),
                 "optimizer_state_dict": self.model.optimizer.state_dict(),
                 "B": self.model.B.detach().cpu(),
+                "architecture_version": str(
+                    getattr(self.model.network, "ARCHITECTURE_VERSION", "unknown")
+                ),
                 "device": self.device,
                 "dim": self.dim,
                 "learning_rate": self.learning_rate,
@@ -700,6 +733,17 @@ class ArmFieldModel:
     def load_checkpoint(self, checkpoint_path: str | Path):
         checkpoint_path = Path(checkpoint_path)
         payload = torch.load(checkpoint_path, map_location=self.device)
+        expected_architecture = str(
+            getattr(self.model.network, "ARCHITECTURE_VERSION", "unknown")
+        )
+        checkpoint_architecture = payload.get("architecture_version")
+        if checkpoint_architecture != expected_architecture:
+            raise RuntimeError(
+                f"Checkpoint {checkpoint_path} uses architecture_version="
+                f"{checkpoint_architecture!r}; this runtime requires "
+                f"{expected_architecture!r}. Legacy metric-only checkpoints are "
+                "incompatible with the factorized arrival-time model and must be retrained."
+            )
         B = payload.get("B")
         if B is not None:
             self.model.B = B.to(self.device).float()

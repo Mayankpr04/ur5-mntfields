@@ -67,7 +67,7 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument("sim_launch_rviz", default_value="true"),
-            DeclareLaunchArgument("output_dir", default_value="/home/mayank/ur_ws/src/ur5_sim_training_urdf_fk"),
+            DeclareLaunchArgument("output_dir", default_value="/home/mayank/ur_ws/src/ur5_sim_training_factorized_v3_fast"),
             DeclareLaunchArgument(
                 "clearance_backend",
                 default_value="original",

@@ -19,9 +19,9 @@ class FieldSliceVisualizer(Node):
     def __init__(self):
         super().__init__("field_slice_visualizer")
         self.declare_parameter("ur_type", "ur5")
-        self.declare_parameter("model_dir", "/home/mayank/ur_ws/src/ur5_sim_training_urdf_fk/model")
-        self.declare_parameter("checkpoint_path", "/home/mayank/ur_ws/src/ur5_sim_training_urdf_fk/model/weights_final.pt")
-        self.declare_parameter("output_dir", "/home/mayank/ur_ws/src/ur5_sim_training_urdf_fk/model/field_slices")
+        self.declare_parameter("model_dir", "/home/mayank/ur_ws/src/ur5_sim_training_factorized_v2/model")
+        self.declare_parameter("checkpoint_path", "/home/mayank/ur_ws/src/ur5_sim_training_factorized_v2/model/weights_final.pt")
+        self.declare_parameter("output_dir", "/home/mayank/ur_ws/src/ur5_sim_training_factorized_v2/model/field_slices")
         self.declare_parameter("start_q", [0.12, -2.3, 1.9, -2.5, -1.57, 0.0])
         self.declare_parameter("goal_q", [0.12, -2.3, 1.9, -2.5, -1.57, 0.0])
         self.declare_parameter("slice_joint_pairs", [0, 1, 1, 2, 2, 3, 3, 4])

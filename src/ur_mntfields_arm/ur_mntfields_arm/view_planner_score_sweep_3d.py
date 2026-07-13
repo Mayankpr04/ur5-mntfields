@@ -108,7 +108,7 @@ def main() -> None:
             "Only the start-pose robot model is displayed."
         )
     )
-    parser.add_argument("--root", type=Path, default=Path("src/ur5_sim_training_urdf_fk"), help="Training output root.")
+    parser.add_argument("--root", type=Path, default=Path("src/ur5_sim_training_factorized_v2"), help="Training output root.")
     parser.add_argument("--step", default="latest", help="Step id like 000129 or 'latest'.")
     parser.add_argument("--checkpoint", type=Path, default=None, help="Checkpoint path. Defaults to latest checkpoint under root/model.")
     parser.add_argument(

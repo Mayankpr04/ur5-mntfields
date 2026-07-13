@@ -90,6 +90,7 @@ def _train_replay_steps(model: ArmFieldModel, steps: int) -> float | None:
         if batch.size == 0:
             continue
         pair_batch = model.build_pair_batch(batch)
+        pair_batch = model.reshuffle_pair_endpoints(pair_batch)
         if pair_batch.size == 0:
             continue
         model.last_train_batch_size = int(len(batch))
@@ -128,7 +129,7 @@ def _print_diag(prefix: str, diag: dict[str, float]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Offline fine-tune UR5 MNTFields from saved replay dumps.")
-    parser.add_argument("--root", type=Path, default=Path("src/ur5_sim_training_urdf_fk"))
+    parser.add_argument("--root", type=Path, default=Path("src/ur5_sim_training_factorized_v2"))
     parser.add_argument("--output-model-dir", type=Path, default=None)
     parser.add_argument("--checkpoint", default="auto", help="'auto', 'none', or a checkpoint path.")
     parser.add_argument("--steps", type=int, default=300, help="Extra optimizer steps to run.")
@@ -141,10 +142,15 @@ def main() -> None:
     parser.add_argument("--replay-capacity", type=int, default=100000)
     parser.add_argument("--minibatch-size", type=int, default=2048)
     parser.add_argument("--replay-ratio", type=float, default=1.0, help="Offline replay-only training should usually use 1.0.")
-    parser.add_argument("--td-loss-weight", type=float, default=1.0e-3)
+    parser.add_argument("--td-loss-weight", type=float, default=0.0)
     parser.add_argument("--speed-loss-weight", type=float, default=1.0e-2)
-    parser.add_argument("--normal-loss-weight", type=float, default=1.0e-3)
-    parser.add_argument("--effective-speed-floor", type=float, default=0.04)
+    parser.add_argument("--log-speed-loss-weight", type=float, default=0.0)
+    parser.add_argument("--near-obstacle-loss-weight", type=float, default=0.0)
+    parser.add_argument("--low-speed-threshold", type=float, default=0.20)
+    parser.add_argument("--low-speed-pred-max", type=float, default=0.30)
+    parser.add_argument("--low-speed-penalty-weight", type=float, default=0.0)
+    parser.add_argument("--normal-loss-weight", type=float, default=0.0)
+    parser.add_argument("--effective-speed-floor", type=float, default=0.10)
     parser.add_argument("--save-plots", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
@@ -175,11 +181,14 @@ def main() -> None:
         replay_ratio=float(np.clip(float(args.replay_ratio), 0.0, 1.0)),
         td_loss_weight=float(args.td_loss_weight),
         speed_loss_weight=float(args.speed_loss_weight),
+        log_speed_loss_weight=float(args.log_speed_loss_weight),
         direct_speed_loss_weight=0.0,
         normal_loss_weight=float(args.normal_loss_weight),
         normal_cos_loss_weight=0.0,
-        near_obstacle_loss_weight=0.0,
-        low_speed_penalty_weight=0.0,
+        near_obstacle_loss_weight=float(args.near_obstacle_loss_weight),
+        low_speed_threshold=float(args.low_speed_threshold),
+        low_speed_pred_max=float(args.low_speed_pred_max),
+        low_speed_penalty_weight=float(args.low_speed_penalty_weight),
         effective_speed_floor=float(args.effective_speed_floor),
     )
 

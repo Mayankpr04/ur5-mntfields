@@ -105,10 +105,14 @@ class ArmMNTFieldsExplorer(Node):
         self.declare_parameter("robot_self_filter_tool_radius_m", 0.08)
         self.declare_parameter("robot_self_filter_mount_radius_m", 0.07)
         self.declare_parameter("clearance_backend", "original")
+        # Sampling and view ranking may use the fast voxel SDF while execution
+        # continues to use the exact point-cloud checker.
+        self.declare_parameter("sampling_clearance_backend", "")
+        self.declare_parameter("nbv_clearance_backend", "")
         self.declare_parameter("sdf_voxel_size_m", 0.04)
         self.declare_parameter("sdf_padding_m", 0.75)
         self.declare_parameter("sdf_max_cells", 4000000)
-        self.declare_parameter("sample_pairs_per_step", 5000)
+        self.declare_parameter("sample_pairs_per_step", 2000)
         self.declare_parameter("samples_per_ik_seed", 64) 
         self.declare_parameter("sampling_mode", "joint_local_6d")
         self.declare_parameter("sampling_proposal_batch_size", 256)
@@ -117,12 +121,17 @@ class ArmMNTFieldsExplorer(Node):
         self.declare_parameter("clearance_label_floor", 0.0)
         self.declare_parameter("clearance_label_power", 1.0)
         self.declare_parameter("anchor_seed_probability", 0.35)
+        self.declare_parameter("roi_sampling_seed_fraction", 0.25)
         self.declare_parameter("use_field_eval_anchors_for_sampling", False)
-        self.declare_parameter("train_epochs_per_step", 30)
+        self.declare_parameter("use_configured_training_anchors", True)
+        self.declare_parameter("training_anchor_joint_goals", [0.0] * 6)
+        self.declare_parameter("train_epochs_per_step", 5)
         self.declare_parameter("train_every_n_frames", 1)
         self.declare_parameter("replay_buffer_capacity", 100000)
-        self.declare_parameter("train_minibatch_size", 512)
+        self.declare_parameter("train_minibatch_size", 2000)
+        self.declare_parameter("train_gradient_accumulation_steps", 1)
         self.declare_parameter("train_replay_ratio", 0.75)
+        self.declare_parameter("hard_example_train_ratio", 0.0)
         self.declare_parameter("replay_recombine_pairs_per_step", 1000)
         self.declare_parameter("adaptive_training_enabled", True)
         self.declare_parameter("field_ready_sample_pairs_per_step", 1500)
@@ -151,15 +160,20 @@ class ArmMNTFieldsExplorer(Node):
         self.declare_parameter("enable_field_diagnostics", True)
         self.declare_parameter("field_diagnostics_max_rows", 4096)
         self.declare_parameter("field_diagnostics_grid_size", 61)
-        self.declare_parameter("field_td_loss_weight", 1.0e-3)
-        self.declare_parameter("field_speed_loss_weight", 5.0e-2)
-        self.declare_parameter("field_direct_speed_loss_weight", 2.0e-1)
-        self.declare_parameter("field_normal_loss_weight", 2.0e-2)
-        self.declare_parameter("field_normal_cos_loss_weight", 1.0e-1)
-        self.declare_parameter("field_near_obstacle_loss_weight", 4.0)
+        self.declare_parameter("field_diagnostics_every_n_train_updates", 5)
+        self.declare_parameter("field_diagnostics_save_joint_slices", False)
+        # Paper Eq. 12 is the default objective.  The TD, direct-speed and
+        # normal losses are experimental auxiliaries and remain opt-in.
+        self.declare_parameter("field_td_loss_weight", 0.0)
+        self.declare_parameter("field_speed_loss_weight", 1.0)
+        self.declare_parameter("field_log_speed_loss_weight", 0.0)
+        self.declare_parameter("field_direct_speed_loss_weight", 0.0)
+        self.declare_parameter("field_normal_loss_weight", 0.0)
+        self.declare_parameter("field_normal_cos_loss_weight", 0.0)
+        self.declare_parameter("field_near_obstacle_loss_weight", 0.0)
         self.declare_parameter("field_low_speed_threshold", 0.20)
         self.declare_parameter("field_low_speed_pred_max", 0.30)
-        self.declare_parameter("field_low_speed_penalty_weight", 5.0e-2)
+        self.declare_parameter("field_low_speed_penalty_weight", 0.0)
         self.declare_parameter("field_effective_speed_floor", 0.05)
         self.declare_parameter("field_diag_gate_enabled", True)
         self.declare_parameter("field_diag_gate_min_replay_pairs", 12000)
@@ -167,6 +181,13 @@ class ArmMNTFieldsExplorer(Node):
         self.declare_parameter("field_diag_min_speed_corr", 0.35)
         self.declare_parameter("field_diag_min_near_far_gap", 0.20)
         self.declare_parameter("field_diag_min_normal_cos_near", 0.20)
+        self.declare_parameter("field_false_free_audit_enabled", True)
+        self.declare_parameter("field_false_free_audit_samples", 1024)
+        self.declare_parameter("field_false_free_audit_goals_per_state", 4)
+        self.declare_parameter("field_false_free_target_speed_max", 0.20)
+        self.declare_parameter("field_false_free_pred_speed_min", 0.20)
+        self.declare_parameter("field_false_free_max_rate", 0.05)
+        self.declare_parameter("field_false_free_min_low_states", 32)
         self.declare_parameter("debug_point_cloud_topic", "/debug/points/world")
         self.declare_parameter("planned_path_topic", "/ur_mntfields_arm/planned_path")
         self.declare_parameter("replan_while_executing", False)
@@ -185,14 +206,18 @@ class ArmMNTFieldsExplorer(Node):
         self.declare_parameter("fast_roi_nbv", True)
         self.declare_parameter("roi_nbv_max_pose_candidates", 18)
         self.declare_parameter("enable_view_self_occlusion_filter", True)
-        self.declare_parameter("min_view_self_occlusion_free_fraction", 0.80)
+        self.declare_parameter("min_view_self_occlusion_free_fraction", 0.98)
         self.declare_parameter("view_self_occlusion_padding_m", 0.03)
+        self.declare_parameter("view_self_occlusion_ignore_near_origin_m", 0.06)
         self.declare_parameter("frontier_roi_init_min_points", 300)
         self.declare_parameter("frontier_roi_init_min_step", 1)
         self.declare_parameter("frontier_roi_padding_xyz", [0.12, 0.12, 0.12])
         self.declare_parameter("scene_boxes", [""])
         self.declare_parameter("scene_boxes_topic", "/scene_boxes")
         self.declare_parameter("scene_boxes_frame", "")
+        self.declare_parameter("support_boxes", [""])
+        self.declare_parameter("support_boxes_frame", "")
+        self.declare_parameter("support_point_ignore_padding_m", 0.15)
         self.declare_parameter("cabinet_bbox_padding_xyz", [0.04, 0.04, 0.04])
         self.declare_parameter("roi_clip_frame", "")
         self.declare_parameter("roi_clip_min_xyz", [-1.0e9, -1.0e9, -1.0e9])
@@ -204,6 +229,7 @@ class ArmMNTFieldsExplorer(Node):
         self.declare_parameter("roi_unknown_stop_voxels", 40)
         self.declare_parameter("field_eval_points_frame", "world")
         self.declare_parameter("field_eval_points_xyz", [0.60, 0.35, 0.68, 0.60, 0.35, 1.12])
+        self.declare_parameter("field_eval_joint_goals", [0.0] * 6)
         self.declare_parameter("field_eval_goal_clearance_min_m", 0.05)
         self.declare_parameter("field_eval_goal_tool_forward_alignment_min", 0.70)
         self.declare_parameter("field_eval_success_ratio_threshold", 1.0)
@@ -211,6 +237,8 @@ class ArmMNTFieldsExplorer(Node):
         self.declare_parameter("field_eval_min_train_steps", 1)
         self.declare_parameter("field_eval_min_replay_pairs", 30000)
         self.declare_parameter("field_eval_use_startup_pose", True)
+        self.declare_parameter("field_eval_collision_aware_rollout", False)
+        self.declare_parameter("training_wall_time_limit_s", 600.0)
         self.declare_parameter("goal_tool_orientation_yaw_offsets_rad", [0.0, 1.5708, -1.5708, 3.1416])
         self.declare_parameter("goal_tool_orientation_pitch_offsets_rad", [0.0, 0.7854, -0.7854, 1.5708, -1.5708])
         self.declare_parameter("goal_tool_orientation_roll_offsets_rad", [0.0, 1.5708, -1.5708, 3.1416])
@@ -226,7 +254,10 @@ class ArmMNTFieldsExplorer(Node):
         self.declare_parameter("min_frontier_visibility_score", 0.05)
         self.declare_parameter("min_roi_coverage_ratio", 0.08)
         self.declare_parameter("min_view_alignment", 0.72)
+        self.declare_parameter("min_actual_view_alignment", 0.85)
         self.declare_parameter("target_context_radius_m", 0.35)
+        self.declare_parameter("frontier_pose_candidates_per_frontier", 15)
+        self.declare_parameter("frontier_fallback_max_frontiers", 3)
         self.declare_parameter("camera_yaw_offsets_deg", [-12.0, 0.0, 12.0])
         self.declare_parameter("camera_pitch_offsets_deg", [-10.0, 0.0, 10.0])
         self.declare_parameter("camera_roll_offsets_deg", [0.0])
@@ -283,6 +314,12 @@ class ArmMNTFieldsExplorer(Node):
             max(0.0, float(self.get_parameter("robot_self_filter_mount_radius_m").value))
         )
         self.clearance_backend = str(self.get_parameter("clearance_backend").value).strip().lower()
+        configured_sampling_backend = str(
+            self.get_parameter("sampling_clearance_backend").value
+        ).strip().lower()
+        self.sampling_clearance_backend = configured_sampling_backend or self.clearance_backend
+        configured_nbv_backend = str(self.get_parameter("nbv_clearance_backend").value).strip().lower()
+        self.nbv_clearance_backend = configured_nbv_backend or self.clearance_backend
         self.sdf_voxel_size_m = float(max(1.0e-3, float(self.get_parameter("sdf_voxel_size_m").value)))
         self.sdf_padding_m = float(max(0.0, float(self.get_parameter("sdf_padding_m").value)))
         self.sdf_max_cells = max(10_000, int(self.get_parameter("sdf_max_cells").value))
@@ -300,12 +337,47 @@ class ArmMNTFieldsExplorer(Node):
         self.clearance_label_floor = float(np.clip(float(self.get_parameter("clearance_label_floor").value), 0.0, 1.0))
         self.clearance_label_power = float(max(1.0e-6, float(self.get_parameter("clearance_label_power").value)))
         self.anchor_seed_probability = float(np.clip(float(self.get_parameter("anchor_seed_probability").value), 0.0, 1.0))
+        self.roi_sampling_seed_fraction = float(
+            np.clip(float(self.get_parameter("roi_sampling_seed_fraction").value), 0.0, 1.0)
+        )
         self.use_field_eval_anchors_for_sampling = bool(self.get_parameter("use_field_eval_anchors_for_sampling").value)
+        training_anchor_values = [float(v) for v in self.get_parameter("training_anchor_joint_goals").value]
+        if len(training_anchor_values) % 6 != 0:
+            raise ValueError(
+                "training_anchor_joint_goals must contain a multiple of 6 values, "
+                f"got {len(training_anchor_values)}"
+            )
+        use_configured_training_anchors = bool(self.get_parameter("use_configured_training_anchors").value)
+        training_anchor_goals = (
+            np.asarray(training_anchor_values, dtype=np.float64).reshape(-1, 6)
+            if use_configured_training_anchors
+            else np.zeros((0, 6), dtype=np.float64)
+        )
+        anchor_waypoints = [
+            np.asarray(self.get_parameter("inspection_positions").value, dtype=np.float64).reshape(6)
+        ] if len(training_anchor_goals) else []
+        anchor_waypoints.extend(training_anchor_goals)
+        training_anchors: list[np.ndarray] = []
+        for qa, qb in zip(anchor_waypoints[:-1], anchor_waypoints[1:]):
+            max_delta = float(np.max(np.abs(qb - qa)))
+            count = max(2, int(np.ceil(max_delta / 0.08)) + 1)
+            training_anchors.extend(
+                qa + alpha * (qb - qa) for alpha in np.linspace(0.0, 1.0, count)
+            )
+        self.training_anchor_qs = (
+            np.asarray(training_anchors, dtype=np.float64)
+            if training_anchors
+            else np.zeros((0, 6), dtype=np.float64)
+        )
         self.train_epochs_per_step = int(self.get_parameter("train_epochs_per_step").value)
         self.train_every_n_frames = int(self.get_parameter("train_every_n_frames").value)
         self.replay_buffer_capacity = int(self.get_parameter("replay_buffer_capacity").value)
         self.train_minibatch_size = int(self.get_parameter("train_minibatch_size").value)
+        self.train_gradient_accumulation_steps = max(
+            1, int(self.get_parameter("train_gradient_accumulation_steps").value)
+        )
         self.train_replay_ratio = float(self.get_parameter("train_replay_ratio").value)
+        self.hard_example_train_ratio = float(self.get_parameter("hard_example_train_ratio").value)
         self.replay_recombine_pairs_per_step = max(0, int(self.get_parameter("replay_recombine_pairs_per_step").value))
         self.adaptive_training_enabled = bool(self.get_parameter("adaptive_training_enabled").value)
         self.field_ready_sample_pairs_per_step = max(0, int(self.get_parameter("field_ready_sample_pairs_per_step").value))
@@ -333,8 +405,15 @@ class ArmMNTFieldsExplorer(Node):
         self.enable_field_diagnostics = bool(self.get_parameter("enable_field_diagnostics").value)
         self.field_diagnostics_max_rows = max(128, int(self.get_parameter("field_diagnostics_max_rows").value))
         self.field_diagnostics_grid_size = max(21, int(self.get_parameter("field_diagnostics_grid_size").value))
+        self.field_diagnostics_every_n_train_updates = max(
+            1, int(self.get_parameter("field_diagnostics_every_n_train_updates").value)
+        )
+        self.field_diagnostics_save_joint_slices = bool(
+            self.get_parameter("field_diagnostics_save_joint_slices").value
+        )
         self.field_td_loss_weight = float(self.get_parameter("field_td_loss_weight").value)
         self.field_speed_loss_weight = float(self.get_parameter("field_speed_loss_weight").value)
+        self.field_log_speed_loss_weight = float(self.get_parameter("field_log_speed_loss_weight").value)
         self.field_direct_speed_loss_weight = float(self.get_parameter("field_direct_speed_loss_weight").value)
         self.field_normal_loss_weight = float(self.get_parameter("field_normal_loss_weight").value)
         self.field_normal_cos_loss_weight = float(self.get_parameter("field_normal_cos_loss_weight").value)
@@ -349,6 +428,27 @@ class ArmMNTFieldsExplorer(Node):
         self.field_diag_min_speed_corr = float(self.get_parameter("field_diag_min_speed_corr").value)
         self.field_diag_min_near_far_gap = float(self.get_parameter("field_diag_min_near_far_gap").value)
         self.field_diag_min_normal_cos_near = float(self.get_parameter("field_diag_min_normal_cos_near").value)
+        self.field_false_free_audit_enabled = bool(
+            self.get_parameter("field_false_free_audit_enabled").value
+        )
+        self.field_false_free_audit_samples = max(
+            128, int(self.get_parameter("field_false_free_audit_samples").value)
+        )
+        self.field_false_free_audit_goals_per_state = max(
+            1, int(self.get_parameter("field_false_free_audit_goals_per_state").value)
+        )
+        self.field_false_free_target_speed_max = float(
+            self.get_parameter("field_false_free_target_speed_max").value
+        )
+        self.field_false_free_pred_speed_min = float(
+            self.get_parameter("field_false_free_pred_speed_min").value
+        )
+        self.field_false_free_max_rate = float(
+            self.get_parameter("field_false_free_max_rate").value
+        )
+        self.field_false_free_min_low_states = max(
+            1, int(self.get_parameter("field_false_free_min_low_states").value)
+        )
         self.debug_point_cloud_topic = str(self.get_parameter("debug_point_cloud_topic").value)
         self.planned_path_topic = str(self.get_parameter("planned_path_topic").value)
         self.replan_while_executing = bool(self.get_parameter("replan_while_executing").value)
@@ -373,6 +473,9 @@ class ArmMNTFieldsExplorer(Node):
         self.view_self_occlusion_padding_m = float(
             max(0.0, float(self.get_parameter("view_self_occlusion_padding_m").value))
         )
+        self.view_self_occlusion_ignore_near_origin_m = float(
+            max(0.0, float(self.get_parameter("view_self_occlusion_ignore_near_origin_m").value))
+        )
         self.frontier_roi_init_min_points = int(self.get_parameter("frontier_roi_init_min_points").value)
         self.frontier_roi_init_min_step = int(self.get_parameter("frontier_roi_init_min_step").value)
         self.frontier_roi_padding_xyz = np.asarray(
@@ -382,6 +485,12 @@ class ArmMNTFieldsExplorer(Node):
         self.scene_boxes_topic = str(self.get_parameter("scene_boxes_topic").value)
         scene_boxes_frame = str(self.get_parameter("scene_boxes_frame").value)
         self.scene_boxes_frame = scene_boxes_frame if scene_boxes_frame else self.base_frame
+        self.support_boxes = self._parse_scene_boxes(self.get_parameter("support_boxes").value)
+        support_boxes_frame = str(self.get_parameter("support_boxes_frame").value)
+        self.support_boxes_frame = support_boxes_frame if support_boxes_frame else self.base_frame
+        self.support_point_ignore_padding_m = float(
+            max(0.0, float(self.get_parameter("support_point_ignore_padding_m").value))
+        )
         self.cabinet_bbox_padding_xyz = np.asarray(
             self.get_parameter("cabinet_bbox_padding_xyz").value, dtype=np.float64
         ).reshape(3)
@@ -402,6 +511,12 @@ class ArmMNTFieldsExplorer(Node):
         self.field_eval_points_xyz = np.asarray(
             [float(v) for v in self.get_parameter("field_eval_points_xyz").value], dtype=np.float64
         ).reshape(-1, 3)
+        field_eval_joint_values = [float(v) for v in self.get_parameter("field_eval_joint_goals").value]
+        if len(field_eval_joint_values) % 6 != 0:
+            raise ValueError(
+                f"field_eval_joint_goals must contain a multiple of 6 values, got {len(field_eval_joint_values)}"
+            )
+        self.field_eval_joint_goals = np.asarray(field_eval_joint_values, dtype=np.float64).reshape(-1, 6)
         self.field_eval_goal_clearance_min_m = float(max(0.0, float(self.get_parameter("field_eval_goal_clearance_min_m").value)))
         self.field_eval_goal_tool_forward_alignment_min = float(
             self.get_parameter("field_eval_goal_tool_forward_alignment_min").value
@@ -411,6 +526,12 @@ class ArmMNTFieldsExplorer(Node):
         self.field_eval_min_train_steps = max(1, int(self.get_parameter("field_eval_min_train_steps").value))
         self.field_eval_min_replay_pairs = max(1, int(self.get_parameter("field_eval_min_replay_pairs").value))
         self.field_eval_use_startup_pose = bool(self.get_parameter("field_eval_use_startup_pose").value)
+        self.field_eval_collision_aware_rollout = bool(
+            self.get_parameter("field_eval_collision_aware_rollout").value
+        )
+        self.training_wall_time_limit_s = max(
+            0.0, float(self.get_parameter("training_wall_time_limit_s").value)
+        )
         self.goal_tool_orientation_yaw_offsets_rad = [
             float(v) for v in self.get_parameter("goal_tool_orientation_yaw_offsets_rad").value
         ]
@@ -434,7 +555,16 @@ class ArmMNTFieldsExplorer(Node):
         self.min_frontier_visibility_score = float(self.get_parameter("min_frontier_visibility_score").value)
         self.min_roi_coverage_ratio = float(self.get_parameter("min_roi_coverage_ratio").value)
         self.min_view_alignment = float(self.get_parameter("min_view_alignment").value)
+        self.min_actual_view_alignment = float(
+            np.clip(float(self.get_parameter("min_actual_view_alignment").value), -1.0, 1.0)
+        )
         self.target_context_radius_m = float(self.get_parameter("target_context_radius_m").value)
+        self.frontier_pose_candidates_per_frontier = max(
+            3, int(self.get_parameter("frontier_pose_candidates_per_frontier").value)
+        )
+        self.frontier_fallback_max_frontiers = max(
+            1, int(self.get_parameter("frontier_fallback_max_frontiers").value)
+        )
         self.camera_yaw_offsets_deg = tuple(float(v) for v in self.get_parameter("camera_yaw_offsets_deg").value)
         self.camera_pitch_offsets_deg = tuple(float(v) for v in self.get_parameter("camera_pitch_offsets_deg").value)
         self.camera_roll_offsets_deg = tuple(float(v) for v in self.get_parameter("camera_roll_offsets_deg").value)
@@ -465,9 +595,12 @@ class ArmMNTFieldsExplorer(Node):
             str(self.output_dir / "model"),
             replay_capacity=self.replay_buffer_capacity,
             minibatch_size=self.train_minibatch_size,
+            gradient_accumulation_steps=self.train_gradient_accumulation_steps,
             replay_ratio=self.train_replay_ratio,
+            priority_ratio=self.hard_example_train_ratio,
             td_loss_weight=self.field_td_loss_weight,
             speed_loss_weight=self.field_speed_loss_weight,
+            log_speed_loss_weight=self.field_log_speed_loss_weight,
             direct_speed_loss_weight=self.field_direct_speed_loss_weight,
             normal_loss_weight=self.field_normal_loss_weight,
             normal_cos_loss_weight=self.field_normal_cos_loss_weight,
@@ -486,7 +619,9 @@ class ArmMNTFieldsExplorer(Node):
             min_frontier_visibility_score=self.min_frontier_visibility_score,
             min_roi_coverage_ratio=self.min_roi_coverage_ratio,
             min_view_alignment=self.min_view_alignment,
+            min_actual_view_alignment=self.min_actual_view_alignment,
             target_context_radius_m=self.target_context_radius_m,
+            frontier_pose_candidates_per_frontier=self.frontier_pose_candidates_per_frontier,
             yaw_offsets_deg=self.camera_yaw_offsets_deg,
             pitch_offsets_deg=self.camera_pitch_offsets_deg,
             roll_offsets_deg=self.camera_roll_offsets_deg,
@@ -495,6 +630,7 @@ class ArmMNTFieldsExplorer(Node):
             enable_self_occlusion_filter=self.enable_view_self_occlusion_filter,
             min_self_occlusion_free_fraction=self.min_view_self_occlusion_free_fraction,
             self_occlusion_padding_m=self.view_self_occlusion_padding_m,
+            self_occlusion_ignore_near_origin_m=self.view_self_occlusion_ignore_near_origin_m,
             self_occlusion_tool_radius_m=self.robot_self_filter_tool_radius_m,
             self_occlusion_mount_radius_m=self.robot_self_filter_mount_radius_m,
         )
@@ -508,6 +644,8 @@ class ArmMNTFieldsExplorer(Node):
         self.current_joints: np.ndarray | None = None
         self.path_training_anchor_qs = np.zeros((0, 6), dtype=np.float64)
         self.hard_failed_anchor_qs = np.zeros((0, 6), dtype=np.float64)
+        self.last_false_free_audit_step = -1
+        self.last_false_free_audit: dict[str, float | str] = {}
         self.current_joint_map: dict[str, float] = {}
         self.last_camera_pose: np.ndarray | None = None
         self.latest_camera_info: CameraInfo | None = None
@@ -527,6 +665,7 @@ class ArmMNTFieldsExplorer(Node):
         self.last_trajectory_publish_wall_time = 0.0
         self.startup_banner_logged = False
         self.network_initialized = False
+        self.network_initialized_wall_time = 0.0
         self.training_finished = False
         self.final_artifacts_saved = False
         self.frontier_completion_empty_steps = 0
@@ -536,6 +675,7 @@ class ArmMNTFieldsExplorer(Node):
         self.last_startup_wait_log_time = 0.0
         self.startup_pose_ready_since_wall_time = 0.0
         self.training_frame_idx = 0
+        self.training_update_count = 0
         self.defer_training_until_motion = False
         self.defer_training_q: np.ndarray | None = None
         self.defer_training_publish_time = 0.0
@@ -566,14 +706,18 @@ class ArmMNTFieldsExplorer(Node):
             f"train_epochs_per_step={self.train_epochs_per_step}, "
             f"train_every_n_frames={self.train_every_n_frames}, "
             f"replay_buffer_capacity={self.replay_buffer_capacity}, train_minibatch_size={self.train_minibatch_size}, "
-            f"train_replay_ratio={self.train_replay_ratio:.2f}, voxel_size_m={self.voxel_map.voxel_size:.3f}, "
+            f"train_gradient_accumulation_steps={self.train_gradient_accumulation_steps}, "
+            f"train_replay_ratio={self.train_replay_ratio:.2f}, "
+            f"hard_example_train_ratio={self.hard_example_train_ratio:.2f}, "
+            f"voxel_size_m={self.voxel_map.voxel_size:.3f}, "
             f"trajectory_publish={self.enable_trajectory_publish}, output_dir={self.output_dir}"
         )
         self.get_logger().info(
             "Field model initialized: "
             f"dim={self.field_model.dim}, device={self.field_model.device}, "
             f"model_dir={self.field_model.model_dir}, lr={self.field_model.learning_rate}, "
-            f"replay_capacity={self.field_model.replay_capacity}, minibatch_size={self.field_model.minibatch_size}"
+            f"replay_capacity={self.field_model.replay_capacity}, minibatch_size={self.field_model.minibatch_size}, "
+            f"effective_batch_size={self.field_model.effective_minibatch_size}"
         )
         self.get_logger().info(
             f"Sampler collision device: {self.robot_self_filter_checker.device}"
@@ -752,21 +896,26 @@ class ArmMNTFieldsExplorer(Node):
         hi = np.max(np.asarray(maxs, dtype=np.float64), axis=0) + self.cabinet_bbox_padding_xyz
         return self._clip_roi_bounds(lo, hi)
 
-    def _scene_boxes_in_base(self) -> np.ndarray:
-        if not self.scene_boxes:
+    def _boxes_in_base(
+        self,
+        boxes: list[np.ndarray],
+        source_frame: str,
+        label: str,
+    ) -> np.ndarray:
+        if not boxes:
             return np.zeros((0, 6), dtype=np.float64)
         tf_m = np.eye(4, dtype=np.float64)
-        if self.scene_boxes_frame != self.base_frame:
+        if source_frame != self.base_frame:
             try:
-                tf = self.tf_buffer.lookup_transform(self.base_frame, self.scene_boxes_frame, rclpy.time.Time())
+                tf = self.tf_buffer.lookup_transform(self.base_frame, source_frame, rclpy.time.Time())
                 tf_m = _transform_to_matrix(tf)
             except TransformException as exc:
                 self.get_logger().warn(
-                    f"Scene box TF lookup failed ({self.scene_boxes_frame} -> {self.base_frame}): {exc}"
+                    f"{label} box TF lookup failed ({source_frame} -> {self.base_frame}): {exc}"
                 )
                 return np.zeros((0, 6), dtype=np.float64)
         out = []
-        for box in self.scene_boxes:
+        for box in boxes:
             center = np.asarray(box[:3], dtype=np.float64)
             size = np.maximum(np.asarray(box[3:], dtype=np.float64), 0.0)
             lo = center - 0.5 * size
@@ -786,12 +935,34 @@ class ArmMNTFieldsExplorer(Node):
             out.append(np.concatenate((0.5 * (base_lo + base_hi), np.maximum(base_hi - base_lo, 1e-6))))
         return np.asarray(out, dtype=np.float64)
 
-    def _make_collision_checker(self, occupied_points: np.ndarray) -> UR5PointCloudCollisionChecker:
+    def _scene_boxes_in_base(self) -> np.ndarray:
+        return self._boxes_in_base(self.scene_boxes, self.scene_boxes_frame, "Scene")
+
+    def _support_boxes_in_base(self) -> np.ndarray:
+        return self._boxes_in_base(self.support_boxes, self.support_boxes_frame, "Support")
+
+    def _make_collision_checker(
+        self,
+        occupied_points: np.ndarray,
+        *,
+        clearance_backend: str | None = None,
+    ) -> UR5PointCloudCollisionChecker:
+        scene_boxes = self._scene_boxes_in_base()
+        support_boxes = self._support_boxes_in_base()
+        if len(scene_boxes) and len(support_boxes):
+            box_obstacles = np.concatenate((scene_boxes, support_boxes), axis=0)
+        elif len(scene_boxes):
+            box_obstacles = scene_boxes
+        else:
+            box_obstacles = support_boxes
+        backend = self.clearance_backend if clearance_backend is None else str(clearance_backend).strip().lower()
         return make_ur5_collision_checker(
             self.kinematics,
             occupied_points,
-            box_obstacles=self._scene_boxes_in_base(),
-            clearance_backend=self.clearance_backend,
+            box_obstacles=box_obstacles,
+            support_box_count=len(support_boxes),
+            support_point_ignore_padding_m=self.support_point_ignore_padding_m,
+            clearance_backend=backend,
             sdf_voxel_size_m=self.sdf_voxel_size_m,
             sdf_padding_m=self.sdf_padding_m,
             sdf_max_cells=self.sdf_max_cells,
@@ -834,13 +1005,16 @@ class ArmMNTFieldsExplorer(Node):
             return False
         self.get_logger().info("Initializing network")
         self.network_initialized = True
+        self.network_initialized_wall_time = time.monotonic()
         self.get_logger().info(
             "Network initialization complete: "
-            f"roi_source={self.frontier_roi_source}, occupied_points={len(occupied_points)}"
+            f"roi_source={self.frontier_roi_source}, occupied_points={len(occupied_points)}, "
+            f"support_boxes={len(self.support_boxes)}"
         )
         self.get_logger().info(
             "Field loss config: "
             f"speed_weight={self.field_speed_loss_weight:.4g}, "
+            f"log_speed_weight={self.field_log_speed_loss_weight:.4g}, "
             f"direct_speed_weight={self.field_direct_speed_loss_weight:.4g}, "
             f"normal_weight={self.field_normal_loss_weight:.4g}, "
             f"normal_cos_weight={self.field_normal_cos_loss_weight:.4g}, "
@@ -852,11 +1026,11 @@ class ArmMNTFieldsExplorer(Node):
         )
         return True
 
-    def _finish_training(self, reason: str):
+    def _finish_training(self, reason: str, *, certified: bool = True):
         if self.training_finished:
             return
         self.training_finished = True
-        enough_training = (
+        enough_training = certified and (
             self.field_model.total_epochs_trained >= self.field_eval_min_train_steps
             and self.field_model.replay_size >= self.field_eval_min_replay_pairs
         )
@@ -988,6 +1162,9 @@ class ArmMNTFieldsExplorer(Node):
         self.frontier_bank.mark_visited_near(camera_pose[:3, 3])
         checker = self._make_collision_checker(occupied_points)
         checker.free_keys = set(self.voxel_map.free)
+        # Lazily created for the expensive online-only paths below. The exact
+        # checker remains the source of truth for planner validation.
+        fast_clearance_checker: UR5PointCloudCollisionChecker | None = None
         map_t3 = time.perf_counter()
         if self.step_idx <= 3 or self.step_idx % 10 == 0:
             roi_status = "uninitialized"
@@ -1011,6 +1188,19 @@ class ArmMNTFieldsExplorer(Node):
             return
 
         if not self._maybe_initialize_network(occupied_points):
+            self._publish_frontiers()
+            return
+        if (
+            self.training_wall_time_limit_s > 0.0
+            and self.network_initialized_wall_time > 0.0
+            and time.monotonic() - self.network_initialized_wall_time
+            >= self.training_wall_time_limit_s
+        ):
+            elapsed = time.monotonic() - self.network_initialized_wall_time
+            self._finish_training(
+                f"wall-time limit reached ({elapsed:.1f}s) before raw field evaluation passed",
+                certified=False,
+            )
             self._publish_frontiers()
             return
         self.training_frame_idx += 1
@@ -1085,10 +1275,15 @@ class ArmMNTFieldsExplorer(Node):
                 f"strict_train_move_cycle={self.strict_train_move_cycle}, "
                 f"train_during_motion={self.train_during_motion}, sample_pairs_per_step={self.sample_pairs_per_step}, "
                 f"sampling_mode={self.sampling_mode}, sampling_proposal_batch_size={self.sampling_proposal_batch_size}, "
-                f"clearance_backend={self.clearance_backend}, sdf_voxel_size_m={self.sdf_voxel_size_m:.3f}, "
+                f"planner_clearance_backend={self.clearance_backend}, "
+                f"sampling_clearance_backend={self.sampling_clearance_backend}, "
+                f"nbv_clearance_backend={self.nbv_clearance_backend}, sdf_voxel_size_m={self.sdf_voxel_size_m:.3f}, "
                 f"path_centered_pair_fraction={self.path_centered_pair_fraction:.2f}, "
                 f"near_boundary_pair_fraction={self.near_boundary_pair_fraction:.2f}, "
                 f"execution_planner={self.execution_planner}, "
+                f"support_boxes={len(self.support_boxes)}, "
+                f"rank_frontiers_when_roi_available={self.rank_frontiers_when_roi_available}, "
+                f"frontier_fallback_max_frontiers={self.frontier_fallback_max_frontiers}, "
                 f"train_steps={self.train_epochs_per_step}, train_every_n_frames={self.train_every_n_frames}, "
                 f"replay_size={self.field_model.replay_size}/{self.field_model.replay_capacity}, "
                 f"minibatch_size={self.field_model.minibatch_size}"
@@ -1125,32 +1320,59 @@ class ArmMNTFieldsExplorer(Node):
             else:
                 should_train_this_frame = False
         if should_train_this_frame and (self.train_during_motion or not is_executing):
+            sample_t0 = time.perf_counter()
+            sampling_checker = checker
+            sampling_checker_build_ms = 0.0
+            if self.sampling_clearance_backend != self.clearance_backend:
+                checker_t0 = time.perf_counter()
+                sampling_checker = self._make_collision_checker(
+                    occupied_points,
+                    clearance_backend=self.sampling_clearance_backend,
+                )
+                sampling_checker.free_keys = checker.free_keys
+                sampling_checker_build_ms = (time.perf_counter() - checker_t0) * 1e3
+            fast_clearance_checker = sampling_checker
             self.get_logger().info(
                 f"step={self.step_idx} post_startup_frame={self.training_frame_idx} collecting training samples: "
                 f"target_pairs={active_sample_pairs} adaptive_ready={adaptive_ready} "
                 f"active_frontiers={len(active_all)} occupied_points={len(occupied_points)} "
                 f"samples_per_ik_seed={self.samples_per_ik_seed} "
-                f"clearance_backend={self.clearance_backend} checker={type(checker).__name__}"
+                f"sampling_backend={self.sampling_clearance_backend} checker={type(sampling_checker).__name__} "
+                f"checker_build_ms={sampling_checker_build_ms:.1f} "
+                f"support_points_filtered={getattr(sampling_checker, 'ignored_support_point_count', 0)}"
             )
-            sample_t0 = time.perf_counter()
             self.last_sample_progress_log = 0.0
 
-            def _sample_progress(attempts: int, accepted: int, ik_seed_tries: int):
-                now = time.monotonic()
-                if now - self.last_sample_progress_log < 2.0:
-                    return
-                self.last_sample_progress_log = now
-                self.get_logger().info(
-                    f"step={self.step_idx} post_startup_frame={self.training_frame_idx} "
-                    f"sampling progress: accepted={accepted}/{active_sample_pairs} "
-                    f"attempts={attempts} seed_batches={ik_seed_tries}"
-                )
+            def _sample_progress(stage_name: str, stage_target: int):
+                def _report(attempts: int, accepted: int, ik_seed_tries: int):
+                    now = time.monotonic()
+                    if now - self.last_sample_progress_log < 2.0:
+                        return
+                    self.last_sample_progress_log = now
+                    self.get_logger().info(
+                        f"step={self.step_idx} post_startup_frame={self.training_frame_idx} "
+                        f"sampling {stage_name} progress: accepted={accepted}/{stage_target} "
+                        f"attempts={attempts} seed_batches={ik_seed_tries}"
+                    )
+
+                return _report
 
             sampler_stats_list: list[dict[str, float]] = []
             raw_rows_list: list[np.ndarray] = []
             frame_rows_list: list[np.ndarray] = []
+            frame_rows_hard = np.zeros((0, 26), dtype=np.float32)
+            path_anchor_sets = []
+            if len(self.training_anchor_qs):
+                path_anchor_sets.append(self.training_anchor_qs)
+            if len(self.path_training_anchor_qs):
+                path_anchor_sets.append(self.path_training_anchor_qs)
+            path_anchor_qs = (
+                np.concatenate(path_anchor_sets, axis=0).astype(np.float64, copy=False)
+                if path_anchor_sets
+                else np.zeros((0, 6), dtype=np.float64)
+            )
             path_pair_target = int(round(active_sample_pairs * self.path_centered_pair_fraction))
-            if len(self.path_training_anchor_qs) == 0:
+            if len(path_anchor_qs) == 0:
                 path_pair_target = 0
             path_pair_target = int(np.clip(path_pair_target, 0, active_sample_pairs))
             global_pair_target = int(active_sample_pairs - path_pair_target)
@@ -1179,15 +1401,16 @@ class ArmMNTFieldsExplorer(Node):
             if path_pair_target > 0:
                 stage_t0 = time.perf_counter()
                 raw_rows_path, frame_rows_path, stats_path = sample_path_centered_training_batch(
-                    checker,
+                    sampling_checker,
                     self.kinematics,
-                    self.path_training_anchor_qs,
+                    path_anchor_qs,
                     path_pair_target,
                     self.clearance_margin_m,
                     self.clearance_offset_m,
                     self.rng,
                     clearance_label_floor=self.clearance_label_floor,
                     clearance_label_power=self.clearance_label_power,
+                    proposal_batch_size=self.sampling_proposal_batch_size,
                 )
                 raw_rows_list.append(raw_rows_path)
                 frame_rows_list.append(frame_rows_path)
@@ -1200,9 +1423,11 @@ class ArmMNTFieldsExplorer(Node):
             if self.anchor_seed_probability > 0.0:
                 anchor_sets = []
                 if self.use_field_eval_anchors_for_sampling:
-                    eval_anchor_qs = self._field_eval_anchor_qs(checker)
+                    eval_anchor_qs = self._field_eval_anchor_qs(sampling_checker)
                     if len(eval_anchor_qs):
                         anchor_sets.append(eval_anchor_qs)
+                if len(self.training_anchor_qs):
+                    anchor_sets.append(self.training_anchor_qs)
                 if len(self.path_training_anchor_qs):
                     anchor_sets.append(self.path_training_anchor_qs)
                 if len(self.hard_failed_anchor_qs):
@@ -1213,7 +1438,7 @@ class ArmMNTFieldsExplorer(Node):
             if near_pair_target > 0:
                 stage_t0 = time.perf_counter()
                 raw_rows_near, frame_rows_near, stats_near = sample_cspace_training_batch(
-                    checker,
+                    sampling_checker,
                     self.kinematics,
                     near_pair_target,
                     self.clearance_margin_m,
@@ -1225,12 +1450,13 @@ class ArmMNTFieldsExplorer(Node):
                     seed_hint_q=self.current_joints,
                     anchor_qs=anchor_qs_for_sampling,
                     anchor_seed_probability=self.anchor_seed_probability,
+                    roi_seed_fraction=self.roi_sampling_seed_fraction,
                     clearance_label_floor=self.clearance_label_floor,
                     clearance_label_power=self.clearance_label_power,
                     sampling_mode=self.sampling_mode,
                     proposal_batch_size=self.sampling_proposal_batch_size,
                     near_boundary_only=True,
-                    progress_cb=_sample_progress,
+                    progress_cb=_sample_progress("near", near_pair_target),
                 )
                 raw_rows_list.append(raw_rows_near)
                 frame_rows_list.append(frame_rows_near)
@@ -1242,7 +1468,7 @@ class ArmMNTFieldsExplorer(Node):
             if broad_pair_target > 0:
                 stage_t0 = time.perf_counter()
                 raw_rows_global, frame_rows_global, stats_global = sample_cspace_training_batch(
-                    checker,
+                    sampling_checker,
                     self.kinematics,
                     broad_pair_target,
                     self.clearance_margin_m,
@@ -1254,12 +1480,13 @@ class ArmMNTFieldsExplorer(Node):
                     seed_hint_q=self.current_joints,
                     anchor_qs=anchor_qs_for_sampling,
                     anchor_seed_probability=self.anchor_seed_probability,
+                    roi_seed_fraction=self.roi_sampling_seed_fraction,
                     clearance_label_floor=self.clearance_label_floor,
                     clearance_label_power=self.clearance_label_power,
                     sampling_mode=self.sampling_mode,
                     proposal_batch_size=self.sampling_proposal_batch_size,
                     near_boundary_only=False,
-                    progress_cb=_sample_progress,
+                    progress_cb=_sample_progress("broad", broad_pair_target),
                 )
                 raw_rows_list.append(raw_rows_global)
                 frame_rows_list.append(frame_rows_global)
@@ -1271,7 +1498,14 @@ class ArmMNTFieldsExplorer(Node):
             hard_pair_count = 0
             if active_hard_failed_pairs > 0 and len(self.hard_failed_anchor_qs) > 0:
                 stage_t0 = time.perf_counter()
-                raw_rows_hard, frame_rows_hard, stats_hard = self._hard_failed_training_rows(checker, active_hard_failed_pairs)
+                raw_rows_hard, frame_rows_hard, stats_hard = self._hard_failed_training_rows(
+                    # Hard anchors come from exact rollout validation and the
+                    # held-out false-free audit. Preserve that source of truth
+                    # instead of relabelling a missed collision with the
+                    # approximate sampling SDF.
+                    checker,
+                    active_hard_failed_pairs,
+                )
                 sample_stage_ms["hard"] = (time.perf_counter() - stage_t0) * 1e3
                 sample_stage_rows["hard_raw"] = int(len(raw_rows_hard))
                 sample_stage_rows["hard_frame"] = int(len(frame_rows_hard))
@@ -1292,8 +1526,10 @@ class ArmMNTFieldsExplorer(Node):
                 if any(len(rows) > 0 for rows in frame_rows_list)
                 else np.zeros((0, 26), dtype=np.float32)
             )
+            persistent_frame_rows = frame_rows
             sample_stage_ms["concat"] = (time.perf_counter() - stage_t0) * 1e3
             recombined_pair_count = 0
+            recombined_rows = np.zeros((0, 26), dtype=np.float32)
             if active_recombine_pairs > 0:
                 stage_t0 = time.perf_counter()
                 recombined_rows = self.field_model.recombine_replay_pairs(active_recombine_pairs)
@@ -1306,7 +1542,9 @@ class ArmMNTFieldsExplorer(Node):
             self.get_logger().info(
                 f"step={self.step_idx} training batch: raw_contact_rows={len(raw_rows)} frame_pairs={len(frame_rows)} "
                 f"train_steps={active_train_steps} occupied_points={len(self.voxel_map.occupied)} "
-                f"clearance_backend={self.clearance_backend} checker={type(checker).__name__} "
+                f"sampling_backend={self.sampling_clearance_backend} checker={type(sampling_checker).__name__} "
+                f"checker_build_ms={sampling_checker_build_ms:.1f} "
+                f"support_points_filtered={getattr(sampling_checker, 'ignored_support_point_count', 0)} "
                 f"hard_pairs={hard_pair_count} recombined_pairs={recombined_pair_count} "
                 f"sample_ms={(sample_t1 - sample_t0) * 1e3:.1f}"
             )
@@ -1342,6 +1580,10 @@ class ArmMNTFieldsExplorer(Node):
                 f"q1_clearance_mean={sample_stats.get('q1_clearance_mean', 0.0):.4f} "
                 f"q0_near_margin_frac={sample_stats.get('q0_near_margin_frac', 0.0):.3f} "
                 f"q1_near_margin_frac={sample_stats.get('q1_near_margin_frac', 0.0):.3f} "
+                f"q0_boundary_shell_frac={sample_stats.get('q0_boundary_shell_frac', 0.0):.3f} "
+                f"q1_obstacle_side_frac={sample_stats.get('q1_obstacle_side_frac', 0.0):.3f} "
+                f"speed0_critical_frac={sample_stats.get('speed0_critical_frac', 0.0):.3f} "
+                f"speed1_critical_frac={sample_stats.get('speed1_critical_frac', 0.0):.3f} "
                 f"speed0_sat_frac={sample_stats.get('speed0_sat_frac', 0.0):.3f} "
                 f"speed1_sat_frac={sample_stats.get('speed1_sat_frac', 0.0):.3f}"
             )
@@ -1349,11 +1591,17 @@ class ArmMNTFieldsExplorer(Node):
                 self.get_logger().info(
                     f"step={self.step_idx} post_startup_frame={self.training_frame_idx} "
                     f"starting training: train_steps={active_train_steps} "
-                    f"fresh_pairs={len(frame_rows)} replay_size={self.field_model.replay_size} "
+                    f"fresh_pairs={len(persistent_frame_rows)} transient_pairs={len(recombined_rows)} "
+                    f"replay_size={self.field_model.replay_size} "
                     f"eval_replay_target={self.field_eval_min_replay_pairs}"
                 )
                 train_t0 = time.perf_counter()
-                loss = self.field_model.train_step(frame_rows, active_train_steps)
+                loss = self.field_model.train_step(
+                    persistent_frame_rows,
+                    active_train_steps,
+                    transient_rows=recombined_rows,
+                    priority_rows=frame_rows_hard,
+                )
                 train_t1 = time.perf_counter()
                 self.get_logger().info(
                     f"step={self.step_idx} training complete: train_steps={active_train_steps} "
@@ -1363,7 +1611,21 @@ class ArmMNTFieldsExplorer(Node):
                     f"replay_size={self.field_model.replay_size} "
                     f"train_ms={(train_t1 - train_t0) * 1e3:.1f}"
                 )
-                if self.enable_field_diagnostics:
+                self.training_update_count += 1
+                should_run_diagnostics = (
+                    self.training_update_count == 1
+                    or self.training_update_count % self.field_diagnostics_every_n_train_updates == 0
+                )
+                checkpoint_epoch = (
+                    self.field_model.total_epochs_trained // self.checkpoint_every_epochs
+                ) * self.checkpoint_every_epochs
+                checkpoint_diagnostics_due = (
+                    checkpoint_epoch > self.field_model.last_checkpoint_epoch and checkpoint_epoch > 0
+                )
+                # The checkpoint plot routine evaluates the same replay metric.
+                # Let it own that pass so a diagnostic checkpoint does not run
+                # two large second-derivative evaluations back-to-back.
+                if self.enable_field_diagnostics and should_run_diagnostics and not checkpoint_diagnostics_due:
                     diag_t0 = time.perf_counter()
                     diag = self.field_model.evaluate_replay_diagnostics(self.field_diagnostics_max_rows)
                     diag_t1 = time.perf_counter()
@@ -1388,7 +1650,10 @@ class ArmMNTFieldsExplorer(Node):
                     camera_pose=camera_pose,
                     points_world=points,
                     raw_rows=raw_rows,
-                    frame_rows=frame_rows,
+                    # Synthetic recombinations are optimizer-only rows. Keep
+                    # saved frame_data collision-labelled so offline replay
+                    # cannot re-ingest transient pairs as observations.
+                    frame_rows=persistent_frame_rows,
                     occupied_points=occupied_points,
                     active_frontiers=active_all,
                     loss=loss,
@@ -1427,15 +1692,36 @@ class ArmMNTFieldsExplorer(Node):
             self._publish_frontiers()
             return
 
+        nbv_checker = checker
+        nbv_checker_build_ms = 0.0
+        if self.nbv_clearance_backend != self.clearance_backend:
+            if (
+                fast_clearance_checker is not None
+                and self.nbv_clearance_backend == self.sampling_clearance_backend
+            ):
+                nbv_checker = fast_clearance_checker
+            else:
+                checker_t0 = time.perf_counter()
+                nbv_checker = self._make_collision_checker(
+                    occupied_points,
+                    clearance_backend=self.nbv_clearance_backend,
+                )
+                nbv_checker.free_keys = checker.free_keys
+                nbv_checker_build_ms = (time.perf_counter() - checker_t0) * 1e3
+
         self.get_logger().info(
             f"step={self.step_idx} starting goal selection: "
             f"active_frontiers={len(active_all)} local_frontiers={len(local_frontiers)} "
             f"global_frontiers={len(global_frontiers)} replay_size={self.field_model.replay_size} "
-            f"epochs_trained={self.field_model.total_epochs_trained}"
+            f"epochs_trained={self.field_model.total_epochs_trained} "
+            f"nbv_backend={self.nbv_clearance_backend} checker={type(nbv_checker).__name__} "
+            f"checker_build_ms={nbv_checker_build_ms:.1f} "
+            f"support_points_filtered={getattr(nbv_checker, 'ignored_support_point_count', 0)}"
         )
 
         current_camera_xyz = camera_pose[:3, 3].copy() if camera_pose is not None else None
         ranked_goals = []
+        rejected_frontier_ids: set[int] = set()
         if (
             self.enable_object_roi_nbv
             and self.object_roi_nbv_first
@@ -1448,7 +1734,7 @@ class ArmMNTFieldsExplorer(Node):
                 self.frontier_roi_min,
                 self.frontier_roi_max,
                 self.current_joints,
-                checker,
+                nbv_checker,
                 camera_info=info_msg,
                 current_camera_xyz=current_camera_xyz,
                 max_candidates=8,
@@ -1460,6 +1746,7 @@ class ArmMNTFieldsExplorer(Node):
                 f"step={self.step_idx} object ROI NBV ranking complete: "
                 f"fast_roi_nbv={self.fast_roi_nbv} "
                 f"candidates_returned={len(roi_goals)} unknown_points={roi_dbg.get('unknown_points', 0)} "
+                f"roi_targets={roi_dbg.get('roi_targets', 0)} "
                 f"candidates={roi_dbg.get('candidates_total', 0)} "
                 f"accepted={roi_dbg.get('accepted', 0)} "
                 f"rejected_visibility={roi_dbg.get('rejected_visibility', 0)} "
@@ -1490,17 +1777,21 @@ class ArmMNTFieldsExplorer(Node):
                     f"accepted={stats.get('accepted', 0)}"
                 )
 
-            ranked_goals.extend(
-                self.goal_selector.ranked_candidates(
+            local_ranked = self.goal_selector.ranked_candidates(
                     local_frontiers,
                     self.current_joints,
-                    checker,
+                    nbv_checker,
                     camera_info=info_msg,
                     current_camera_xyz=current_camera_xyz,
                     step_idx=self.step_idx,
                     max_candidates=6,
+                    max_frontiers=self.frontier_fallback_max_frontiers,
                     progress_cb=_rank_progress_local,
                 )
+            ranked_goals.extend(local_ranked)
+            rejected_frontier_ids.update(
+                int(fid)
+                for fid in self.goal_selector.last_select_debug.get("rejected_frontier_ids", [])
             )
             rank_t1 = time.perf_counter()
             self.get_logger().info(
@@ -1508,7 +1799,13 @@ class ArmMNTFieldsExplorer(Node):
                 f"local_frontiers={len(local_frontiers)} candidates_returned={len(ranked_goals)} "
                 f"rank_ms={(rank_t1 - rank_t0) * 1e3:.1f}"
             )
-        if global_frontiers and should_rank_frontiers:
+        # A local fallback candidate is already a usable next view. Ranking a
+        # second, disjoint global set only adds repeated IK/collision work and
+        # previously accounted for several seconds of every failed ROI pass.
+        should_rank_global = should_rank_frontiers and (
+            not ranked_goals or self.rank_frontiers_when_roi_available
+        )
+        if global_frontiers and should_rank_global:
             rank_t0 = time.perf_counter()
             last_rank_log = [0.0]
 
@@ -1528,12 +1825,17 @@ class ArmMNTFieldsExplorer(Node):
             global_ranked = self.goal_selector.ranked_candidates(
                 global_frontiers,
                 self.current_joints,
-                checker,
+                nbv_checker,
                 camera_info=info_msg,
                 current_camera_xyz=current_camera_xyz,
                 step_idx=self.step_idx,
                 max_candidates=8,
+                max_frontiers=self.frontier_fallback_max_frontiers,
                 progress_cb=_rank_progress_global,
+            )
+            rejected_frontier_ids.update(
+                int(fid)
+                for fid in self.goal_selector.last_select_debug.get("rejected_frontier_ids", [])
             )
             for goal in global_ranked:
                 if int(goal.frontier_id) in seen_frontier_ids and len(ranked_goals) >= 2:
@@ -1546,6 +1848,11 @@ class ArmMNTFieldsExplorer(Node):
                 f"global_frontiers={len(global_frontiers)} candidates_returned={len(global_ranked)} "
                 f"rank_ms={(rank_t1 - rank_t0) * 1e3:.1f}"
             )
+        elif global_frontiers and should_rank_frontiers and ranked_goals:
+            self.get_logger().info(
+                f"step={self.step_idx} skipping global frontier ranking because local fallback produced "
+                f"{len(ranked_goals)} candidate(s)."
+            )
         ranked_goals.sort(key=lambda goal: goal.score, reverse=True)
         ranked_goals = self._filter_viewpoint_cooldown(ranked_goals)
         ranked_goals = ranked_goals[:10]
@@ -1557,6 +1864,19 @@ class ArmMNTFieldsExplorer(Node):
             self.get_logger().info(
                 f"step={self.step_idx} no feasible NBV goal selected from {len(active_all)} active frontiers."
             )
+            retired_ids = []
+            for frontier_id in sorted(rejected_frontier_ids):
+                rec = self.frontier_bank.records.get(frontier_id)
+                was_active = rec is not None and rec.status == "active"
+                self.frontier_bank.mark_failed(frontier_id)
+                rec = self.frontier_bank.records.get(frontier_id)
+                if was_active and rec is not None and rec.status == "retired":
+                    retired_ids.append(frontier_id)
+            if rejected_frontier_ids:
+                self.get_logger().info(
+                    f"step={self.step_idx} NBV rejection accounting: failed_frontiers="
+                    f"{sorted(rejected_frontier_ids)} retired={retired_ids}"
+                )
             if dbg:
                 self.get_logger().info(
                     f"step={self.step_idx} selector debug: frontiers={dbg.get('frontiers_considered', 0)} "
@@ -1570,8 +1890,19 @@ class ArmMNTFieldsExplorer(Node):
                     f"rejected_cooldown={dbg.get('rejected_cooldown', 0)}"
                 )
             recovery_goals = self._filter_viewpoint_cooldown(
-                self._bootstrap_recovery_goals(checker, info_msg, current_camera_xyz, active_all)
+                self._bootstrap_recovery_goals(nbv_checker, info_msg, current_camera_xyz, active_all)
             )
+            if not recovery_goals:
+                # Task-space look-at poses can all fail single-seed IK near
+                # cabinet edges even though useful nearby configurations are
+                # reachable. Fall back to a bounded C-space lattice: FK makes
+                # reachability exact, then the same actual-camera visibility
+                # gates decide whether the view is useful.
+                recovery_goals = self._filter_viewpoint_cooldown(
+                    self._joint_space_recovery_goals(
+                        nbv_checker, info_msg, current_camera_xyz, active_all
+                    )
+                )
             if recovery_goals:
                 self.get_logger().info(
                     f"step={self.step_idx} attempting bootstrap recovery views: candidates={len(recovery_goals)}"
@@ -1807,7 +2138,7 @@ class ArmMNTFieldsExplorer(Node):
         return np.asarray(dedup, dtype=np.float64)
 
     def _evaluate_field_goal_library(self, checker: UR5PointCloudCollisionChecker) -> dict[str, object]:
-        if len(self.field_eval_points_xyz) == 0:
+        if len(self.field_eval_points_xyz) == 0 and len(self.field_eval_joint_goals) == 0:
             result: dict[str, object] = {"success_ratio": 0.0, "success_count": 0, "evaluated": 0, "goals": []}
             self.last_field_eval = result
             return result
@@ -1819,15 +2150,25 @@ class ArmMNTFieldsExplorer(Node):
         goals_out: list[dict[str, object]] = []
         success_count = 0
         evaluated = 0
-        cached_candidates = self._field_eval_goal_candidates(checker, q_start)
-        for idx, target_base in enumerate(self._field_eval_targets_in_base(), start=1):
-            candidates = cached_candidates[idx - 1] if idx - 1 < len(cached_candidates) else []
+        targets_base = self._field_eval_targets_in_base()
+        if len(self.field_eval_joint_goals) > 0:
+            goal_specs = [
+                (None, [(np.asarray(q, dtype=np.float64), float(checker.clearance(q)))])
+                for q in self.field_eval_joint_goals
+            ]
+        else:
+            cached_candidates = self._field_eval_goal_candidates(checker, q_start)
+            goal_specs = [
+                (target, cached_candidates[i] if i < len(cached_candidates) else [])
+                for i, target in enumerate(targets_base)
+            ]
+        for idx, (target_base, candidates) in enumerate(goal_specs, start=1):
             best_goal_clearance = -1.0
             best_path_clearance = -1.0
             best_debug: dict[str, object] = {}
             success = False
             for q_goal, goal_clearance in candidates:
-                if self.collision_aware_field_rollout:
+                if self.field_eval_collision_aware_rollout:
                     plan = self.planner.plan_collision_aware(
                         checker,
                         q_start,
@@ -1839,14 +2180,17 @@ class ArmMNTFieldsExplorer(Node):
                     )
                     debug = dict(getattr(self.planner, "last_debug", {}) or {})
                 else:
-                    plan = self.planner.plan(
+                    plan = self.planner.plan_learned_speed_search(
                         q_start,
                         q_goal,
                         self.step_size_q,
                         self.rollout_max_steps,
-                        mode="forward_only",
+                        min_predicted_speed=0.10,
+                        max_local_candidates=self.field_local_rollout_candidates,
+                        allow_direct_edge=False,
+                        mode="bidirectional",
                     )
-                    debug = {"status": "field_forward_only"}
+                    debug = dict(getattr(self.planner, "last_debug", {}) or {})
                 path_ok, min_clearance = self._validate_plan_collision(checker, plan)
                 best_goal_clearance = max(best_goal_clearance, float(goal_clearance))
                 best_path_clearance = max(best_path_clearance, float(min_clearance))
@@ -1870,7 +2214,8 @@ class ArmMNTFieldsExplorer(Node):
             goals_out.append(
                 {
                     "goal_index": idx,
-                    "target_base_xyz": np.round(target_base, 3).tolist(),
+                    "target_base_xyz": None if target_base is None else np.round(target_base, 3).tolist(),
+                    "target_q": None if not candidates else np.round(candidates[0][0], 3).tolist(),
                     "candidate_count": len(candidates),
                     "success": success,
                     "best_goal_clearance_m": best_goal_clearance,
@@ -1946,7 +2291,10 @@ class ArmMNTFieldsExplorer(Node):
             failures.append(f"speed_corr={speed_corr:.3f}<{self.field_diag_min_speed_corr:.3f}")
         if near_far_gap < self.field_diag_min_near_far_gap:
             failures.append(f"near_far_gap={near_far_gap:.3f}<{self.field_diag_min_near_far_gap:.3f}")
-        if normal_cos_near < self.field_diag_min_normal_cos_near:
+        normal_supervised = (
+            self.field_normal_loss_weight > 0.0 or self.field_normal_cos_loss_weight > 0.0
+        )
+        if normal_supervised and normal_cos_near < self.field_diag_min_normal_cos_near:
             failures.append(
                 f"normal_cos_near={normal_cos_near:.3f}<{self.field_diag_min_normal_cos_near:.3f}"
             )
@@ -1961,6 +2309,126 @@ class ArmMNTFieldsExplorer(Node):
             f"speed_corr={speed_corr:.3f}, near_far_gap={near_far_gap:.3f}, "
             f"normal_cos_near={normal_cos_near:.3f}, low_overpred={low_overpred:.3f}",
         )
+
+    def _field_false_free_audit(
+        self, checker: UR5PointCloudCollisionChecker
+    ) -> tuple[bool, str]:
+        """Check held-out C-space states for unsafe free-space predictions.
+
+        Replay diagnostics only measure interpolation on samples already seen by
+        the optimizer.  A model can therefore have good aggregate correlation
+        while assigning a high speed to an unsampled colliding configuration.
+        This audit uses fresh, goal-independent joint states, exact geometric
+        clearances, and independent random goals.  Failed states are retained as
+        hard anchors so subsequent online updates explicitly train the missed
+        obstacle region.
+        """
+        if not self.field_false_free_audit_enabled:
+            return True, "disabled"
+        if self.last_false_free_audit_step == self.step_idx:
+            cached = dict(self.last_false_free_audit)
+            return bool(cached.get("passed", 0.0)), str(cached.get("reason", "cached"))
+
+        count = int(self.field_false_free_audit_samples)
+        # Do not perturb the exploration/sampling RNG.  Varying the seed by map
+        # step gives a new held-out audit whenever training is reconsidered.
+        audit_rng = np.random.default_rng(104729 + int(self.step_idx))
+        q = audit_rng.uniform(
+            self.kinematics.joint_min,
+            self.kinematics.joint_max,
+            size=(count, 6),
+        ).astype(np.float64)
+        goals_per_state = int(self.field_false_free_audit_goals_per_state)
+        goal_q = audit_rng.uniform(
+            self.kinematics.joint_min,
+            self.kinematics.joint_max,
+            size=(count * goals_per_state, 6),
+        ).astype(np.float64)
+
+        clearance_parts: list[np.ndarray] = []
+        for start in range(0, count, 128):
+            clearance_parts.append(
+                np.asarray(checker.clearance_batch(q[start : start + 128]), dtype=np.float32)
+            )
+        clearances = np.concatenate(clearance_parts) if clearance_parts else np.zeros((0,), dtype=np.float32)
+
+        margin = max(float(self.clearance_margin_m), 1.0e-6)
+        offset = float(np.clip(self.clearance_offset_m, 0.0, margin - 1.0e-6))
+        alpha = np.clip(clearances, offset, margin) / margin
+        alpha = alpha ** max(1.0e-6, float(self.clearance_label_power))
+        floor = float(np.clip(self.clearance_label_floor, 0.0, 1.0))
+        target = floor + (1.0 - floor) * alpha
+
+        qn = self.kinematics.normalize(q)
+        query_qn = np.repeat(qn, goals_per_state, axis=0)
+        goal_qn = self.kinematics.normalize(goal_q)
+        pred, _ = self.field_model.predict_normalized_pair_speeds(query_qn, goal_qn, batch_size=1024)
+        query_clearances = np.repeat(clearances, goals_per_state)
+        query_target = np.repeat(target, goals_per_state)
+        finite = np.isfinite(query_clearances) & np.isfinite(query_target) & np.isfinite(pred)
+        low = finite & (query_target <= float(self.field_false_free_target_speed_max))
+        false_free = low & (pred >= float(self.field_false_free_pred_speed_min))
+        low_state_count = int(
+            np.count_nonzero(np.isfinite(clearances) & np.isfinite(target) & (target <= float(self.field_false_free_target_speed_max)))
+        )
+        low_pair_count = int(np.count_nonzero(low))
+        false_free_count = int(np.count_nonzero(false_free))
+        false_free_rate = float(false_free_count) / float(max(1, low_pair_count))
+
+        enough_low = low_state_count >= int(self.field_false_free_min_low_states)
+        passed = bool(enough_low and false_free_rate <= float(self.field_false_free_max_rate))
+        if not enough_low:
+            reason = (
+                f"low_states={low_state_count}<{self.field_false_free_min_low_states} "
+                f"from audit_samples={count}"
+            )
+        else:
+            reason = (
+                f"false_free={false_free_count}/{low_pair_count} rate={false_free_rate:.3f} "
+                f"low_states={low_state_count} goals_per_state={goals_per_state} "
+                f"max={self.field_false_free_max_rate:.3f} "
+                f"target<={self.field_false_free_target_speed_max:.2f} "
+                f"pred>={self.field_false_free_pred_speed_min:.2f}"
+            )
+
+        if false_free_count > 0:
+            failed_pair_idx = np.flatnonzero(false_free)
+            error = pred[failed_pair_idx] - query_target[failed_pair_idx]
+            ordered_pairs = failed_pair_idx[np.argsort(error)[::-1]]
+            # Retain at most one copy of a state even if several independent
+            # goals expose the same false-free prediction.
+            worst_state_idx = []
+            seen_state_idx: set[int] = set()
+            for pair_idx in ordered_pairs:
+                state_idx = int(pair_idx) // goals_per_state
+                if state_idx in seen_state_idx:
+                    continue
+                seen_state_idx.add(state_idx)
+                worst_state_idx.append(state_idx)
+                if len(worst_state_idx) >= 64:
+                    break
+            anchors = q[np.asarray(worst_state_idx, dtype=np.int64)]
+            merged = (
+                anchors
+                if len(self.hard_failed_anchor_qs) == 0
+                else np.vstack((self.hard_failed_anchor_qs, anchors))
+            )
+            if len(merged) > self.hard_failed_anchor_buffer_limit:
+                merged = merged[-self.hard_failed_anchor_buffer_limit :]
+            self.hard_failed_anchor_qs = merged.astype(np.float64, copy=False)
+
+        self.last_false_free_audit_step = int(self.step_idx)
+        self.last_false_free_audit = {
+            "passed": float(passed),
+            "audit_samples": float(count),
+            "audit_pairs": float(count * goals_per_state),
+            "low_states": float(low_state_count),
+            "low_pairs": float(low_pair_count),
+            "false_free_count": float(false_free_count),
+            "false_free_rate": float(false_free_rate),
+            "reason": reason,
+        }
+        return passed, reason
 
     def _adaptive_training_ready(self) -> bool:
         if not self.adaptive_training_enabled:
@@ -2011,12 +2479,24 @@ class ArmMNTFieldsExplorer(Node):
         voxel = float(checker.voxel_size)
         lo_key = np.floor(np.asarray(self.frontier_roi_min, dtype=np.float64) / voxel).astype(int)
         hi_key = np.floor(np.asarray(self.frontier_roi_max, dtype=np.float64) / voxel).astype(int)
+        boxes = np.asarray(
+            getattr(checker, "box_obstacles", np.zeros((0, 6))), dtype=np.float64
+        ).reshape(-1, 6)
+        box_centers = boxes[:, :3]
+        box_half_extents = 0.5 * boxes[:, 3:]
         known = 0
         unknown = 0
         for ix in range(int(lo_key[0]), int(hi_key[0]) + 1):
             for iy in range(int(lo_key[1]), int(hi_key[1]) + 1):
                 for iz in range(int(lo_key[2]), int(hi_key[2]) + 1):
                     key = (ix, iy, iz)
+                    if len(boxes):
+                        center = np.asarray(checker.key_to_center(key), dtype=np.float64)
+                        inside_static_geometry = np.any(
+                            np.all(np.abs(center - box_centers) <= box_half_extents, axis=1)
+                        )
+                        if inside_static_geometry:
+                            continue
                     if key in checker.free_keys or key in checker.occupied_keys:
                         known += 1
                     else:
@@ -2067,6 +2547,14 @@ class ArmMNTFieldsExplorer(Node):
             self.get_logger().info(
                 "ROI coverage is ready but deferring finish until field diagnostics improve: "
                 f"{diag_reason}"
+            )
+            return
+        audit_ok, audit_reason = self._field_false_free_audit(checker)
+        self.get_logger().info(f"step={self.step_idx} held-out false-free audit: {audit_reason}")
+        if not audit_ok:
+            self.get_logger().info(
+                "ROI coverage is ready but unsafe held-out field predictions were hard-mined; "
+                "continuing training."
             )
             return
         if self.step_idx % self.field_eval_every_n_steps != 0:
@@ -2122,6 +2610,14 @@ class ArmMNTFieldsExplorer(Node):
             self.get_logger().info(
                 "Field-eval finish is ready but diagnostics have not passed yet: "
                 f"{diag_reason}"
+            )
+            return
+        audit_ok, audit_reason = self._field_false_free_audit(checker)
+        self.get_logger().info(f"step={self.step_idx} held-out false-free audit: {audit_reason}")
+        if not audit_ok:
+            self.get_logger().info(
+                "Field-eval finish is blocked by unsafe held-out predictions; "
+                "the worst states were added to hard-example training."
             )
             return
         if self.step_idx % self.field_eval_every_n_steps != 0:
@@ -2216,7 +2712,6 @@ class ArmMNTFieldsExplorer(Node):
             not self.enable_bootstrap_recovery
             or self.current_joints is None
             or current_camera_xyz is None
-            or len(active_frontiers) == 0
         ):
             return []
         aim_points = self._bootstrap_aim_points(active_frontiers)
@@ -2238,10 +2733,12 @@ class ArmMNTFieldsExplorer(Node):
         true_up = np.cross(right, view_dir)
         true_up /= max(np.linalg.norm(true_up), 1e-6)
 
-        seed_frontier = min(
-            active_frontiers,
-            key=lambda rec: float(np.linalg.norm(rec.centroid.astype(np.float64) - focus)),
-        )
+        seed_frontier_id = -1
+        if active_frontiers:
+            seed_frontier_id = int(min(
+                active_frontiers,
+                key=lambda rec: float(np.linalg.norm(rec.centroid.astype(np.float64) - focus)),
+            ).frontier_id)
         candidates: list[ViewGoal] = []
         offsets = [
             np.zeros(3, dtype=np.float64),
@@ -2253,9 +2750,12 @@ class ArmMNTFieldsExplorer(Node):
             self.bootstrap_recovery_lateral_m * right - self.bootstrap_recovery_radius_m * view_dir,
             -self.bootstrap_recovery_lateral_m * right - self.bootstrap_recovery_radius_m * view_dir,
         ]
+        bootstrap_candidate_budget = 24
         for focus in aim_points:
             focus = np.asarray(focus, dtype=np.float64)
             for offset in offsets:
+                if stats["candidates_total"] >= bootstrap_candidate_budget:
+                    break
                 stats["candidates_total"] += 1
                 cam_pos = current_camera_xyz + offset
                 # Bootstrap should always face the ROI directly rather than using the broader NBV orientation cone.
@@ -2265,7 +2765,14 @@ class ArmMNTFieldsExplorer(Node):
                     stats["rejected_projection"] += 1
                     continue
                 tool_pose = self.kinematics.camera_to_tool_pose(cam_pose, self.camera_in_tool)
-                q_goal = self.kinematics.solve_ik_full(tool_pose, np.asarray(self.current_joints, dtype=np.float64))
+                # Full IK may try more than 1000 nonlinear restart seeds for
+                # each unreachable pose. Across this 48-pose recovery sweep it
+                # caused multi-minute callback stalls. Keep task-space
+                # recovery bounded; the reachability-first joint lattice below
+                # covers useful views that fast IK cannot realize.
+                q_goal = self.kinematics.solve_ik_fast(
+                    tool_pose, np.asarray(self.current_joints, dtype=np.float64)
+                )
                 if q_goal is None:
                     stats["rejected_ik"] += 1
                     continue
@@ -2276,13 +2783,39 @@ class ArmMNTFieldsExplorer(Node):
                 if clearance <= 0.0:
                     stats["rejected_clearance"] += 1
                     continue
+                # IK is approximate and may converge to a different wrist
+                # orientation than the requested look-at pose. Validate and
+                # retain the pose FK says the robot will actually reach. The
+                # old bootstrap path scored/stored ``cam_pose`` directly, so a
+                # joint solution whose optical axis faced away from the ROI
+                # could still pass every projection/visibility test.
+                actual_tool_pose = self.kinematics.fk(q_goal)
+                actual_cam_pose = self.kinematics.tool_to_camera_pose(
+                    actual_tool_pose, self.camera_in_tool
+                )
+                actual_cam_pos = np.asarray(actual_cam_pose[:3, 3], dtype=np.float64)
+                target_ok, reject_reason = self.goal_selector._actual_target_view_is_valid(
+                    checker,
+                    q_goal,
+                    actual_cam_pose,
+                    focus,
+                    camera_info,
+                )
+                if not target_ok:
+                    if reject_reason == "self_occlusion":
+                        stats["rejected_self_occlusion"] += 1
+                    else:
+                        stats["rejected_visibility"] += 1
+                    continue
                 self_free_fraction = self.goal_selector._self_occlusion_free_fraction(
-                    checker, q_goal, cam_pos, focus.reshape(1, 3)
+                    checker, q_goal, actual_cam_pos, focus.reshape(1, 3)
                 )
                 if self_free_fraction < self.min_view_self_occlusion_free_fraction:
                     stats["rejected_self_occlusion"] += 1
                     continue
-                target_visibility = self.goal_selector._ray_clearance_score(checker, cam_pos, focus, collision_radius_m=0.04)
+                target_visibility = self.goal_selector._ray_clearance_score(
+                    checker, actual_cam_pos, focus, collision_radius_m=0.04
+                )
                 if target_visibility <= 0.02:
                     stats["rejected_visibility"] += 1
                     continue
@@ -2293,9 +2826,11 @@ class ArmMNTFieldsExplorer(Node):
                     target = rec.centroid.astype(np.float64)
                     if float(np.linalg.norm(target - focus)) > self.target_context_radius_m:
                         continue
-                    if self.goal_selector._project_to_image(cam_pose, target, camera_info) is None:
+                    if self.goal_selector._project_to_image(actual_cam_pose, target, camera_info) is None:
                         continue
-                    if self.goal_selector._ray_clearance_score(checker, cam_pos, target, collision_radius_m=0.04) <= 0.0:
+                    if self.goal_selector._ray_clearance_score(
+                        checker, actual_cam_pos, target, collision_radius_m=0.04
+                    ) <= 0.0:
                         continue
                     visible_neighbors += 1
                 if visible_neighbors > 0:
@@ -2308,10 +2843,10 @@ class ArmMNTFieldsExplorer(Node):
                 )
                 candidates.append(
                     ViewGoal(
-                        frontier_id=int(seed_frontier.frontier_id),
+                        frontier_id=seed_frontier_id,
                         centroid=focus.copy(),
-                        camera_pose=cam_pose.copy(),
-                        tool_pose=tool_pose.copy(),
+                        camera_pose=actual_cam_pose.copy(),
+                        tool_pose=actual_tool_pose.copy(),
                         q_goal=q_goal.copy(),
                         score=float(score),
                         pose_kind="bootstrap",
@@ -2323,7 +2858,167 @@ class ArmMNTFieldsExplorer(Node):
                     )
                 )
                 stats["accepted"] += 1
+            if stats["candidates_total"] >= bootstrap_candidate_budget:
+                break
         candidates.sort(key=lambda goal: goal.score, reverse=True)
+        return candidates[:6]
+
+    def _joint_space_recovery_goals(
+        self,
+        checker: UR5PointCloudCollisionChecker,
+        camera_info: CameraInfo | None,
+        current_camera_xyz: np.ndarray | None,
+        active_frontiers: list,
+    ) -> list[ViewGoal]:
+        """Return useful, guaranteed-reachable views from a local C-space lattice."""
+        stats = {
+            "candidates_total": 0,
+            "rejected_same_pose": 0,
+            "rejected_clearance": 0,
+            "rejected_visibility": 0,
+            "rejected_self_occlusion": 0,
+            "accepted": 0,
+        }
+        self.last_joint_recovery_debug = stats
+        if self.current_joints is None or camera_info is None:
+            return []
+
+        q_base = np.asarray(self.current_joints, dtype=np.float64).reshape(6)
+        targets = self._bootstrap_aim_points(active_frontiers)
+        ranked_frontiers = sorted(active_frontiers, key=lambda rec: rec.voxel_count, reverse=True)
+        targets.extend(np.asarray(rec.centroid, dtype=np.float64) for rec in ranked_frontiers[:8])
+        unique_targets: list[np.ndarray] = []
+        for target in targets:
+            target = np.asarray(target, dtype=np.float64).reshape(3)
+            if not any(np.linalg.norm(target - prior) < 0.03 for prior in unique_targets):
+                unique_targets.append(target)
+
+        deltas: list[np.ndarray] = []
+        for axis, magnitudes in (
+            (0, (0.20, 0.40, 0.60)),
+            (1, (0.18, 0.35)),
+            (2, (0.18, 0.35)),
+            (3, (0.25, 0.50)),
+            (4, (0.25, 0.50)),
+            (5, (0.30, 0.60)),
+        ):
+            for magnitude in magnitudes:
+                for sign in (-1.0, 1.0):
+                    delta = np.zeros((6,), dtype=np.float64)
+                    delta[axis] = sign * magnitude
+                    deltas.append(delta)
+        # Coupled shoulder/wrist changes preserve position better than a large
+        # single-joint move while sweeping the camera optical axis.
+        for shoulder in (-0.40, 0.40):
+            for wrist in (-0.45, 0.45):
+                delta = np.zeros((6,), dtype=np.float64)
+                delta[0] = shoulder
+                delta[4] = wrist
+                deltas.append(delta)
+                delta2 = delta.copy()
+                delta2[1] = -0.20 if shoulder > 0.0 else 0.20
+                deltas.append(delta2)
+
+        candidates: list[ViewGoal] = []
+        for delta in deltas:
+            stats["candidates_total"] += 1
+            q_goal = self.kinematics.clamp(q_base + delta)
+            move_cost = float(np.linalg.norm(q_goal - q_base))
+            if move_cost < self.min_goal_joint_delta_rad:
+                stats["rejected_same_pose"] += 1
+                continue
+            clearance = float(checker.clearance(q_goal))
+            if clearance <= max(0.0, self.trajectory_collision_margin_m):
+                stats["rejected_clearance"] += 1
+                continue
+            tool_pose = self.kinematics.fk(q_goal)
+            cam_pose = self.kinematics.tool_to_camera_pose(tool_pose, self.camera_in_tool)
+            cam_pos = np.asarray(cam_pose[:3, 3], dtype=np.float64)
+            if current_camera_xyz is not None and np.linalg.norm(
+                cam_pos - np.asarray(current_camera_xyz, dtype=np.float64)
+            ) < self.min_camera_goal_delta_m:
+                stats["rejected_same_pose"] += 1
+                continue
+
+            best_target = None
+            best_alignment = -1.0
+            best_visibility = 0.0
+            for target in unique_targets:
+                ray = target - cam_pos
+                ray_norm = float(np.linalg.norm(ray))
+                if ray_norm < 1.0e-6:
+                    continue
+                alignment = float(np.dot(cam_pose[:3, 2], ray / ray_norm))
+                if alignment < self.min_actual_view_alignment:
+                    continue
+                if self.goal_selector._project_to_image(cam_pose, target, camera_info) is None:
+                    continue
+                visibility = self.goal_selector._ray_clearance_score(
+                    checker, cam_pos, target, collision_radius_m=0.035
+                )
+                if visibility <= 0.0:
+                    continue
+                if alignment + 0.35 * visibility > best_alignment + 0.35 * best_visibility:
+                    best_target = target
+                    best_alignment = alignment
+                    best_visibility = visibility
+            if best_target is None:
+                stats["rejected_visibility"] += 1
+                continue
+            self_free = self.goal_selector._self_occlusion_free_fraction(
+                checker, q_goal, cam_pos, best_target.reshape(1, 3)
+            )
+            if self_free < self.min_view_self_occlusion_free_fraction:
+                stats["rejected_self_occlusion"] += 1
+                continue
+
+            visible_frontiers = 0
+            for rec in active_frontiers:
+                if self.goal_selector._project_to_image(
+                    cam_pose, rec.centroid.astype(np.float64), camera_info
+                ) is not None:
+                    visible_frontiers += 1
+            local_coverage = float(visible_frontiers) / float(max(1, len(active_frontiers)))
+            score = (
+                0.65 * best_visibility
+                + 0.35 * best_alignment
+                + 0.30 * local_coverage
+                + 0.25 * min(clearance, 0.25)
+                - 0.20 * move_cost
+            )
+            nearest_frontier_id = -1
+            if active_frontiers:
+                nearest_frontier_id = int(min(
+                    active_frontiers,
+                    key=lambda rec: float(
+                        np.linalg.norm(rec.centroid.astype(np.float64) - best_target)
+                    ),
+                ).frontier_id)
+            candidates.append(
+                ViewGoal(
+                    frontier_id=nearest_frontier_id,
+                    centroid=best_target.copy(),
+                    camera_pose=cam_pose.copy(),
+                    tool_pose=tool_pose.copy(),
+                    q_goal=np.asarray(q_goal, dtype=np.float64).copy(),
+                    score=float(score),
+                    pose_kind="joint_recovery",
+                    visibility_score=float(best_visibility),
+                    local_coverage=float(local_coverage),
+                    gain_score=float(visible_frontiers),
+                    move_cost=move_cost,
+                    clearance=clearance,
+                )
+            )
+            stats["accepted"] += 1
+        candidates.sort(key=lambda goal: goal.score, reverse=True)
+        if candidates:
+            self.get_logger().info(
+                f"step={self.step_idx} joint-space recovery: candidates={stats['candidates_total']} "
+                f"accepted={stats['accepted']} rejected_visibility={stats['rejected_visibility']} "
+                f"rejected_clearance={stats['rejected_clearance']} "
+                f"rejected_self_occlusion={stats['rejected_self_occlusion']}"
+            )
         return candidates[:6]
 
     def _prune_viewpoint_cooldown(self):
@@ -2369,12 +3064,11 @@ class ArmMNTFieldsExplorer(Node):
                 f"radius_m={self.viewpoint_cooldown_radius_m:.2f} steps={self.viewpoint_cooldown_steps}"
             )
         if not out and goals:
-            keep = min(3, len(goals))
             self.get_logger().info(
                 f"step={self.step_idx} viewpoint cooldown covered all candidates; "
-                f"allowing best {keep} candidate(s) to avoid blocking exploration."
+                "keeping them rejected to prevent two-view oscillation."
             )
-            return goals[:keep]
+            return []
         return out
 
     def _attempt_goal_execution(
@@ -2533,15 +3227,41 @@ class ArmMNTFieldsExplorer(Node):
             self.defer_training_until_motion = False
             self.defer_training_q = None
             self.defer_training_publish_time = 0.0
-            self._record_viewpoint_cooldown(goal.camera_pose[:3, 3])
-            self._append_path_training_anchors(self.last_plan)
-            viz_plan = self._prepare_execution_plan(
+            exec_plan = self._prepare_execution_plan(
                 self.last_plan,
                 None if self.current_joints is None else np.asarray(self.current_joints, dtype=np.float64),
             )
-            self._publish_planned_path(viz_plan if len(viz_plan) else self.last_plan)
+            exec_plan = self._truncate_execution_prefix(
+                exec_plan,
+                None if self.current_joints is None else np.asarray(self.current_joints, dtype=np.float64),
+            )
+            exec_ok, exec_min_clearance = self._validate_plan_collision(checker, exec_plan)
+            if not exec_ok:
+                self.frontier_bank.mark_failed(goal.frontier_id)
+                self._append_failed_rollout_anchors(checker, exec_plan)
+                self.get_logger().warn(
+                    f"Rejected post-processed execution path for frontier {goal.frontier_id}: "
+                    f"min_clearance_m={exec_min_clearance:.4f} "
+                    f"required_margin_m={self.trajectory_collision_margin_m:.4f}."
+                )
+                self.last_plan = None
+                continue
+            execution_reaches_view_goal = bool(
+                len(exec_plan)
+                and np.max(np.abs(np.asarray(exec_plan[-1], dtype=np.float64) - np.asarray(goal.q_goal, dtype=np.float64)))
+                <= 1.0e-3
+            )
+            if execution_reaches_view_goal:
+                self._record_viewpoint_cooldown(goal.camera_pose[:3, 3])
+            else:
+                self.get_logger().info(
+                    "Execution prefix stops before the selected NBV pose; keeping that viewpoint eligible until its "
+                    "post-IK camera pose is actually reached."
+                )
+            self._append_path_training_anchors(self.last_plan)
+            self._publish_planned_path(exec_plan)
             if self.enable_trajectory_publish:
-                self._publish_joint_trajectory(self.last_plan)
+                self._publish_joint_trajectory(exec_plan, already_prepared=True)
                 if self.strict_train_move_cycle and self.current_joints is not None:
                     self.defer_training_until_motion = True
                     self.defer_training_q = np.asarray(self.current_joints, dtype=np.float64).copy()
@@ -2621,43 +3341,44 @@ class ArmMNTFieldsExplorer(Node):
         if target_pairs <= 0 or len(self.hard_failed_anchor_qs) == 0:
             stats = self._empty_aux_sampler_stats("hard_failed_rollout")
             return np.zeros((0, 12), dtype=np.float32), np.zeros((0, 26), dtype=np.float32), stats
-        count = min(target_pairs, max(1, len(self.hard_failed_anchor_qs) * 4))
-        idx = self.rng.integers(0, len(self.hard_failed_anchor_qs), size=count)
-        q0 = self.hard_failed_anchor_qs[idx].astype(np.float32, copy=True)
-        d0, n0 = checker.clearance_and_normal_batch(q0)
-        normal_mag = np.linalg.norm(n0, axis=1)
-        valid = normal_mag > 1.0e-8
-        if not np.any(valid):
-            stats = self._empty_aux_sampler_stats("hard_failed_rollout")
-            return np.zeros((0, 12), dtype=np.float32), np.zeros((0, 26), dtype=np.float32), stats
-        q0 = q0[valid]
-        d0 = d0[valid]
-        n0 = n0[valid]
-        target = self.rng.uniform(
-            self.clearance_offset_m,
-            max(self.clearance_offset_m + 1.0e-4, self.clearance_margin_m),
-            size=len(q0),
-        )
-        q_contact = np.asarray(
-            [self.kinematics.clamp(q - float(d) * n) for q, d, n in zip(q0, d0, n0)],
-            dtype=np.float32,
-        )
-        q1 = np.asarray(
-            [self.kinematics.clamp(qc + float(t) * n) for qc, t, n in zip(q_contact, target, n0)],
-            dtype=np.float32,
-        )
-        raw, rows, stats = make_cspace_pair_rows_from_q_pairs(
+        # Preserve exact failed rollout states, including configurations on or
+        # inside the obstacle boundary. The ordinary free-space sampler drops
+        # d < clearance_offset states, which previously erased the most useful
+        # evidence from a wall-crossing raw trajectory.
+        barrier_count = min(max(1, target_pairs // 2), target_pairs)
+        anchor_idx = self.rng.integers(0, len(self.hard_failed_anchor_qs), size=barrier_count)
+        barrier_q = self.hard_failed_anchor_qs[anchor_idx]
+        raw_barrier, rows_barrier, _barrier_stats = make_cspace_pair_rows_from_q_pairs(
             checker,
             self.kinematics,
-            q0,
-            q1,
+            barrier_q,
+            barrier_q,
             self.clearance_margin_m,
-            self.clearance_offset_m,
-            clearance_label_floor=self.clearance_label_floor,
+            0.0,
+            clearance_label_floor=0.0,
             clearance_label_power=self.clearance_label_power,
             require_offset_clearance=False,
         )
-        stats["sampling_mode"] = "hard_failed_rollout"
+        remaining = max(0, target_pairs - len(rows_barrier))
+        raw_local, rows_local, stats = sample_path_centered_training_batch(
+            checker,
+            self.kinematics,
+            self.hard_failed_anchor_qs,
+            remaining,
+            self.clearance_margin_m,
+            self.clearance_offset_m,
+            self.rng,
+            clearance_label_floor=self.clearance_label_floor,
+            clearance_label_power=self.clearance_label_power,
+            proposal_batch_size=self.sampling_proposal_batch_size,
+        )
+        raw_parts = [part for part in (raw_barrier, raw_local) if len(part)]
+        row_parts = [part for part in (rows_barrier, rows_local) if len(part)]
+        raw = np.concatenate(raw_parts, axis=0).astype(np.float32, copy=False) if raw_parts else np.zeros((0, 12), dtype=np.float32)
+        rows = np.concatenate(row_parts, axis=0).astype(np.float32, copy=False) if row_parts else np.zeros((0, 26), dtype=np.float32)
+        stats["sampling_mode"] = "hard_failed_rollout:barrier+requeried"
+        stats["accepted_pairs"] = float(len(rows))
+        stats["barrier_pairs"] = float(len(rows_barrier))
         return raw, rows, stats
 
     def _empty_aux_sampler_stats(self, mode: str) -> dict[str, float]:
@@ -2698,9 +3419,10 @@ class ArmMNTFieldsExplorer(Node):
             "roi_seed_tries", "workspace_seed_tries", "roi_seed_success", "workspace_seed_success",
         }
         mean_keys = {
-            "speed0_sat_frac", "speed1_sat_frac", "q0_clearance_mean", "q0_clearance_min", "q0_clearance_max",
+            "speed0_sat_frac", "speed1_sat_frac", "speed0_low_frac", "speed1_low_frac",
+            "speed0_critical_frac", "speed1_critical_frac", "q0_clearance_mean", "q0_clearance_min", "q0_clearance_max",
             "q0_near_margin_frac", "q1_clearance_mean", "q1_clearance_min", "q1_clearance_max",
-            "q1_near_margin_frac",
+            "q1_near_margin_frac", "q0_boundary_shell_frac", "q1_obstacle_side_frac",
         }
         total_attempts = sum(float(s.get("attempts", 0.0)) for s in stats_list)
         total_seeds = sum(float(s.get("ik_seed_tries", 0.0)) for s in stats_list)
@@ -2828,7 +3550,7 @@ class ArmMNTFieldsExplorer(Node):
         msg.data = points.tobytes()
         self.debug_points_pub.publish(msg)
 
-    def _publish_joint_trajectory(self, plan: np.ndarray):
+    def _publish_joint_trajectory(self, plan: np.ndarray, *, already_prepared: bool = False):
         if plan is None or len(plan) == 0:
             return
         msg = JointTrajectory()
@@ -2836,11 +3558,12 @@ class ArmMNTFieldsExplorer(Node):
         msg.joint_names = JOINT_NAMES
         current_q = None if self.current_joints is None else np.asarray(self.current_joints, dtype=np.float64)
         t_cur = 0.5
-        exec_plan = self._prepare_execution_plan(plan, current_q)
+        exec_plan = np.asarray(plan, dtype=np.float64) if already_prepared else self._prepare_execution_plan(plan, current_q)
         if len(exec_plan) == 0:
             self.get_logger().warn("Skipping trajectory publish because the planned path had no finite execution waypoints.")
             return
-        exec_plan = self._truncate_execution_prefix(exec_plan, current_q)
+        if not already_prepared:
+            exec_plan = self._truncate_execution_prefix(exec_plan, current_q)
         if len(exec_plan) == 0:
             self.get_logger().warn("Skipping trajectory publish because no execution prefix remained after truncation.")
             return
@@ -2881,7 +3604,13 @@ class ArmMNTFieldsExplorer(Node):
         pts = np.asarray(exec_plan, dtype=np.float64)
         if pts.ndim != 2 or len(pts) == 0:
             return np.zeros((0, 6), dtype=np.float64)
-        max_points = max(1, int(self.execute_prefix_waypoints))
+        max_points = int(self.execute_prefix_waypoints)
+        if max_points <= 0:
+            full_plan = pts.copy()
+            if current_q is not None and len(full_plan):
+                full_plan[0] = np.asarray(current_q, dtype=np.float64)
+            return full_plan
+        max_points = max(1, max_points)
         prefix = pts[:max_points].copy()
         if current_q is not None and len(prefix):
             prefix[0] = np.asarray(current_q, dtype=np.float64)
@@ -3018,6 +3747,10 @@ class ArmMNTFieldsExplorer(Node):
         self._write_pcd(self.pcd_dir / f"step_{step_idx:06d}_depth_world.pcd", points_world)
         self._write_pcd(self.pcd_dir / f"step_{step_idx:06d}_occupied_world.pcd", occupied_points)
         self._save_debug_images(step_idx, depth_image_m, camera_info, camera_pose, active_frontiers)
+        self.get_logger().info(
+            f"Saved training view artifacts: step={step_idx} pairs={len(frame_rows)} "
+            f"replay_size={self.field_model.replay_size} samples_dir={self.samples_dir}"
+        )
 
     def _save_debug_images(
         self,
@@ -3094,12 +3827,15 @@ class ArmMNTFieldsExplorer(Node):
             f.write(pts.tobytes())
 
     def _save_model_artifacts_if_needed(self):
-        self.field_model.save_loss_plot(self.model_artifacts_dir / "train_loss.png")
         target_checkpoint_epoch = (
             self.field_model.total_epochs_trained // self.checkpoint_every_epochs
         ) * self.checkpoint_every_epochs
         if target_checkpoint_epoch <= self.field_model.last_checkpoint_epoch or target_checkpoint_epoch <= 0:
             return
+        # Rendering a Matplotlib loss plot on every online collection cycle
+        # adds CPU/GPU synchronization without changing the optimizer state.
+        # Persist it alongside the checkpoint instead.
+        self.field_model.save_loss_plot(self.model_artifacts_dir / "train_loss.png")
         checkpoint_path = self.model_artifacts_dir / f"weights_epoch_{target_checkpoint_epoch:06d}.pt"
         self.field_model.save_checkpoint(checkpoint_path)
         self.field_model.last_checkpoint_epoch = target_checkpoint_epoch
@@ -3114,6 +3850,7 @@ class ArmMNTFieldsExplorer(Node):
                     q_start=None if self.current_joints is None else np.asarray(self.current_joints, dtype=np.float64),
                     max_rows=self.field_diagnostics_max_rows,
                     grid_size=self.field_diagnostics_grid_size,
+                    include_joint_slices=self.field_diagnostics_save_joint_slices,
                 )
                 if saved:
                     self.get_logger().info(
@@ -3143,9 +3880,19 @@ class ArmMNTFieldsExplorer(Node):
             "latest_goal": self.latest_goal_meta,
             "last_plan_len": 0 if self.last_plan is None else int(len(self.last_plan)),
             "loss_history": self.field_model.loss_history[-20:],
+            "total_epochs_trained": int(self.field_model.total_epochs_trained),
             "replay_size": int(self.field_model.replay_size),
             "replay_capacity": int(self.field_model.replay_capacity),
             "train_minibatch_size": int(self.field_model.minibatch_size),
+            "effective_train_batch_size": int(self.field_model.effective_minibatch_size),
+            "field_diagnostics_update_count": int(self.training_update_count),
+            "field_diagnostics": dict(self.field_model.last_diagnostics),
+            "field_eval": {
+                "success_ratio": float(self.last_field_eval.get("success_ratio", 0.0)),
+                "success_count": int(self.last_field_eval.get("success_count", 0)),
+                "evaluated": int(self.last_field_eval.get("evaluated", 0)),
+                "collision_aware_rollout": bool(self.field_eval_collision_aware_rollout),
+            },
         }
         (self.output_dir / "status.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 

@@ -20,7 +20,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 from ur_mntfields_arm.arm_field_model import ArmFieldModel
 from ur_mntfields_arm.collision_checker import UR5PointCloudCollisionChecker, make_ur5_collision_checker
-from ur_mntfields_arm.planner import ArmFieldPlanner
+from ur_mntfields_arm.planner import ArmFieldPlanner, JointSpaceRRTConnectPlanner
 from ur_mntfields_arm.ur5_kinematics import JOINT_NAMES, UR5Kinematics, look_at_rotation
 
 
@@ -94,10 +94,56 @@ class FieldPathTest(Node):
         self.declare_parameter("step_size_q", 0.03)
         self.declare_parameter("rollout_max_steps", 120)
         self.declare_parameter("planner_mode", "bidirectional")
+        self.declare_parameter("planner_type", "field_search")
         self.declare_parameter("planner_direct_edge", True)
         self.declare_parameter("planner_shortcut", True)
+        self.declare_parameter("rrt_step_size_q", 0.20)
+        self.declare_parameter("rrt_max_iters", 4000)
+        self.declare_parameter("rrt_goal_bias", 0.20)
+        self.declare_parameter("rrt_edge_check_step_rad", 0.04)
+        self.declare_parameter("collision_cloud_path", "")
         self.declare_parameter("collision_aware_field_rollout", True)
+        self.declare_parameter("trajectory_collision_validation_enabled", True)
         self.declare_parameter("field_local_rollout_candidates", 32)
+        # The configured obstacle-side label is 0.10, so accepting >= 0.10
+        # treats the intended collision label as free. Keep a real separation
+        # between the label floor and an executable learned edge.
+        self.declare_parameter("learned_speed_search_min_speed", 0.20)
+        self.declare_parameter("field_path_joint_edge_weight", 0.0)
+        self.declare_parameter("field_path_tool_edge_weight", 0.0)
+        self.declare_parameter("field_path_tool_goal_weight", -1.0)
+        self.declare_parameter("field_path_clearance_penalty_weight", 0.0)
+        self.declare_parameter("field_path_clearance_soft_margin_m", 0.04)
+        self.declare_parameter("field_path_return_first_goal", True)
+        self.declare_parameter("field_path_forward_probe_fraction", 0.15)
+        self.declare_parameter("field_cartesian_candidate_count", 0)
+        self.declare_parameter("field_cartesian_candidate_step_m", 0.05)
+        self.declare_parameter("field_cartesian_candidate_damping", 1.0e-3)
+        self.declare_parameter("cartesian_graph_tool_edge_weight", 1.0)
+        self.declare_parameter("cartesian_graph_tool_goal_weight", 2.0)
+        self.declare_parameter("cartesian_graph_joint_edge_weight", 0.05)
+        self.declare_parameter("cartesian_graph_joint_goal_weight", 0.25)
+        self.declare_parameter("cartesian_graph_tau_weight", 0.0)
+        self.declare_parameter("cartesian_graph_clearance_penalty_weight", 0.0)
+        self.declare_parameter("cartesian_graph_clearance_soft_margin_m", 0.04)
+        self.declare_parameter("cartesian_shortcut_enabled", False)
+        self.declare_parameter("cartesian_shortcut_tool_weight", 1.0)
+        self.declare_parameter("cartesian_shortcut_joint_weight", 0.10)
+        self.declare_parameter("cartesian_shortcut_smoothness_weight", 0.0)
+        self.declare_parameter("cartesian_shortcut_min_improvement", 0.01)
+        self.declare_parameter("cartesian_shortcut_max_skip", 48)
+        self.declare_parameter("cartesian_shortcut_try_reverse", False)
+        self.declare_parameter("sampled_rollout_samples", 256)
+        self.declare_parameter("sampled_rollout_horizon", 8)
+        self.declare_parameter("sampled_rollout_iterations", 2)
+        self.declare_parameter("sampled_rollout_noise_scale", 1.0)
+        self.declare_parameter("sampled_rollout_temperature", 35.0)
+        self.declare_parameter("sampled_rollout_tau_weight", 0.55)
+        self.declare_parameter("sampled_rollout_goal_dist_weight", 3.0)
+        self.declare_parameter("sampled_rollout_joint_path_weight", 0.20)
+        self.declare_parameter("sampled_rollout_tool_path_weight", 1.0)
+        self.declare_parameter("sampled_rollout_clearance_penalty_weight", 8.0)
+        self.declare_parameter("sampled_rollout_topk_edge_checks", 64)
         self.declare_parameter("direct_joint_fallback_enabled", False)
         self.declare_parameter("publish_trajectory", True)
         self.declare_parameter("startup_pose_tolerance_rad", 0.05)
@@ -121,6 +167,17 @@ class FieldPathTest(Node):
         self.declare_parameter("fixed_goal_sequence_enabled", False)
         self.declare_parameter("fixed_goal_mode", "point")
         self.declare_parameter("fixed_goal_return_to_first", False)
+        self.declare_parameter("fixed_goal_anchor_routing_enabled", False)
+        self.declare_parameter(
+            "fixed_goal_anchor_joint_position",
+            [-0.0834, -2.0102, 2.7639, -3.8953, -1.4873, 0.0],
+            ParameterDescriptor(type=ParameterType.PARAMETER_DOUBLE_ARRAY),
+        )
+        self.declare_parameter(
+            "fixed_goal_anchor_route_indices",
+            [1, 0, 2, 3, 0, 1],
+            ParameterDescriptor(type=ParameterType.PARAMETER_INTEGER_ARRAY),
+        )
         self.declare_parameter(
             "fixed_goal_joint_positions",
             [0.0] * 6,
@@ -128,13 +185,20 @@ class FieldPathTest(Node):
         )
         self.declare_parameter("fixed_goal_points_frame", "world")
         self.declare_parameter("fixed_goal_points_xyz", [0.60, 0.35, 0.68, 0.60, 0.35, 1.12, 0.78, 0.35, 0.68])
+        self.declare_parameter("fixed_goal_points_xyz_csv", "")
         self.declare_parameter("fixed_goal_reached_tolerance_rad", 0.05)
+        self.declare_parameter("fixed_goal_settle_s", 0.75)
         self.declare_parameter("goal_view_standoff_m", [0.35, 0.45, 0.55])
         self.declare_parameter("goal_view_vertical_offsets_m", [0.0, 0.10, -0.10])
         self.declare_parameter("goal_view_lateral_offsets_m", [0.0, 0.10, -0.10])
         self.declare_parameter("goal_camera_alignment_min", 0.92)
         self.declare_parameter("goal_candidate_clearance_min_m", 0.01)
         self.declare_parameter("goal_tool_forward_alignment_min", 0.70)
+        self.declare_parameter("goal_candidate_sweep_enabled", False)
+        self.declare_parameter("goal_candidate_sweep_execute_best", False)
+        self.declare_parameter("goal_candidate_sweep_save_path", "")
+        self.declare_parameter("goal_candidate_execute_indices_csv", "")
+        self.declare_parameter("goal_candidate_execute_return_startup", True)
         self.declare_parameter("path_shortcut_max_passes", 0)
         self.declare_parameter("path_shortcut_interp_step_rad", 0.04)
         self.declare_parameter("goal_tool_orientation_yaw_offsets_rad", [0.0, 1.5708, -1.5708, 3.1416])
@@ -142,6 +206,8 @@ class FieldPathTest(Node):
         self.declare_parameter("goal_tool_orientation_roll_offsets_rad", [0.0, 1.5708, -1.5708, 3.1416])
         self.declare_parameter("scene_boxes", [""])
         self.declare_parameter("scene_boxes_frame", "")
+        self.declare_parameter("support_boxes", [""])
+        self.declare_parameter("support_boxes_frame", "")
 
         self.depth_topic = str(self.get_parameter("depth_topic").value)
         self.camera_info_topic = str(self.get_parameter("camera_info_topic").value)
@@ -176,10 +242,86 @@ class FieldPathTest(Node):
         self.step_size_q = float(self.get_parameter("step_size_q").value)
         self.rollout_max_steps = int(self.get_parameter("rollout_max_steps").value)
         self.planner_mode = str(self.get_parameter("planner_mode").value).strip().lower()
+        self.planner_type = str(self.get_parameter("planner_type").value).strip().lower()
         self.planner_direct_edge = bool(self.get_parameter("planner_direct_edge").value)
         self.planner_shortcut = bool(self.get_parameter("planner_shortcut").value)
+        self.rrt_step_size_q = max(0.01, float(self.get_parameter("rrt_step_size_q").value))
+        self.rrt_max_iters = max(1, int(self.get_parameter("rrt_max_iters").value))
+        self.rrt_goal_bias = float(np.clip(float(self.get_parameter("rrt_goal_bias").value), 0.0, 1.0))
+        self.rrt_edge_check_step_rad = max(
+            1.0e-3, float(self.get_parameter("rrt_edge_check_step_rad").value)
+        )
+        self.collision_cloud_path = str(self.get_parameter("collision_cloud_path").value).strip()
         self.collision_aware_field_rollout = bool(self.get_parameter("collision_aware_field_rollout").value)
+        self.trajectory_collision_validation_enabled = bool(
+            self.get_parameter("trajectory_collision_validation_enabled").value
+        )
         self.field_local_rollout_candidates = max(4, int(self.get_parameter("field_local_rollout_candidates").value))
+        self.learned_speed_search_min_speed = float(
+            np.clip(float(self.get_parameter("learned_speed_search_min_speed").value), 0.0, 1.0)
+        )
+        self.field_path_joint_edge_weight = float(self.get_parameter("field_path_joint_edge_weight").value)
+        self.field_path_tool_edge_weight = float(self.get_parameter("field_path_tool_edge_weight").value)
+        configured_tool_goal_weight = float(self.get_parameter("field_path_tool_goal_weight").value)
+        self.field_path_tool_goal_weight = None if configured_tool_goal_weight < 0.0 else configured_tool_goal_weight
+        self.field_path_clearance_penalty_weight = float(self.get_parameter("field_path_clearance_penalty_weight").value)
+        self.field_path_clearance_soft_margin_m = max(
+            0.0, float(self.get_parameter("field_path_clearance_soft_margin_m").value)
+        )
+        self.field_path_return_first_goal = bool(self.get_parameter("field_path_return_first_goal").value)
+        self.field_path_forward_probe_fraction = float(
+            np.clip(float(self.get_parameter("field_path_forward_probe_fraction").value), 0.0, 1.0)
+        )
+        self.field_cartesian_candidate_count = max(0, int(self.get_parameter("field_cartesian_candidate_count").value))
+        self.field_cartesian_candidate_step_m = max(
+            1.0e-4, float(self.get_parameter("field_cartesian_candidate_step_m").value)
+        )
+        self.field_cartesian_candidate_damping = max(
+            1.0e-8, float(self.get_parameter("field_cartesian_candidate_damping").value)
+        )
+        self.cartesian_graph_tool_edge_weight = max(
+            0.0, float(self.get_parameter("cartesian_graph_tool_edge_weight").value)
+        )
+        self.cartesian_graph_tool_goal_weight = max(
+            0.0, float(self.get_parameter("cartesian_graph_tool_goal_weight").value)
+        )
+        self.cartesian_graph_joint_edge_weight = max(
+            0.0, float(self.get_parameter("cartesian_graph_joint_edge_weight").value)
+        )
+        self.cartesian_graph_joint_goal_weight = max(
+            0.0, float(self.get_parameter("cartesian_graph_joint_goal_weight").value)
+        )
+        self.cartesian_graph_tau_weight = max(0.0, float(self.get_parameter("cartesian_graph_tau_weight").value))
+        self.cartesian_graph_clearance_penalty_weight = max(
+            0.0, float(self.get_parameter("cartesian_graph_clearance_penalty_weight").value)
+        )
+        self.cartesian_graph_clearance_soft_margin_m = max(
+            0.0, float(self.get_parameter("cartesian_graph_clearance_soft_margin_m").value)
+        )
+        self.cartesian_shortcut_enabled = bool(self.get_parameter("cartesian_shortcut_enabled").value)
+        self.cartesian_shortcut_tool_weight = max(0.0, float(self.get_parameter("cartesian_shortcut_tool_weight").value))
+        self.cartesian_shortcut_joint_weight = max(0.0, float(self.get_parameter("cartesian_shortcut_joint_weight").value))
+        self.cartesian_shortcut_smoothness_weight = max(
+            0.0, float(self.get_parameter("cartesian_shortcut_smoothness_weight").value)
+        )
+        self.cartesian_shortcut_min_improvement = max(
+            0.0, float(self.get_parameter("cartesian_shortcut_min_improvement").value)
+        )
+        self.cartesian_shortcut_max_skip = max(2, int(self.get_parameter("cartesian_shortcut_max_skip").value))
+        self.cartesian_shortcut_try_reverse = bool(self.get_parameter("cartesian_shortcut_try_reverse").value)
+        self.sampled_rollout_samples = max(8, int(self.get_parameter("sampled_rollout_samples").value))
+        self.sampled_rollout_horizon = max(2, int(self.get_parameter("sampled_rollout_horizon").value))
+        self.sampled_rollout_iterations = max(1, int(self.get_parameter("sampled_rollout_iterations").value))
+        self.sampled_rollout_noise_scale = max(0.0, float(self.get_parameter("sampled_rollout_noise_scale").value))
+        self.sampled_rollout_temperature = max(1.0e-6, float(self.get_parameter("sampled_rollout_temperature").value))
+        self.sampled_rollout_tau_weight = float(self.get_parameter("sampled_rollout_tau_weight").value)
+        self.sampled_rollout_goal_dist_weight = float(self.get_parameter("sampled_rollout_goal_dist_weight").value)
+        self.sampled_rollout_joint_path_weight = float(self.get_parameter("sampled_rollout_joint_path_weight").value)
+        self.sampled_rollout_tool_path_weight = float(self.get_parameter("sampled_rollout_tool_path_weight").value)
+        self.sampled_rollout_clearance_penalty_weight = float(
+            self.get_parameter("sampled_rollout_clearance_penalty_weight").value
+        )
+        self.sampled_rollout_topk_edge_checks = max(1, int(self.get_parameter("sampled_rollout_topk_edge_checks").value))
         self.direct_joint_fallback_enabled = bool(self.get_parameter("direct_joint_fallback_enabled").value)
         self.publish_trajectory = bool(self.get_parameter("publish_trajectory").value)
         self.startup_pose_tolerance_rad = float(self.get_parameter("startup_pose_tolerance_rad").value)
@@ -203,24 +345,70 @@ class FieldPathTest(Node):
         self.fixed_goal_sequence_enabled = bool(self.get_parameter("fixed_goal_sequence_enabled").value)
         self.fixed_goal_mode = str(self.get_parameter("fixed_goal_mode").value).strip().lower()
         self.fixed_goal_return_to_first = bool(self.get_parameter("fixed_goal_return_to_first").value)
+        self.fixed_goal_anchor_routing_enabled = bool(
+            self.get_parameter("fixed_goal_anchor_routing_enabled").value
+        )
         fixed_goal_joints = [float(v) for v in self.get_parameter("fixed_goal_joint_positions").value]
         if len(fixed_goal_joints) % 6 != 0:
             raise ValueError(
                 f"fixed_goal_joint_positions must contain a multiple of 6 values, got {len(fixed_goal_joints)}"
             )
         self.fixed_goal_joint_positions = np.asarray(fixed_goal_joints, dtype=np.float64).reshape(-1, 6)
-        self.fixed_goal_joint_sequence = self._goal_sequence_with_optional_return(self.fixed_goal_joint_positions)
+        anchor_joint_values = [float(v) for v in self.get_parameter("fixed_goal_anchor_joint_position").value]
+        if len(anchor_joint_values) != 6:
+            raise ValueError(
+                f"fixed_goal_anchor_joint_position must contain 6 values, got {len(anchor_joint_values)}"
+            )
+        self.fixed_goal_anchor_joint_position = np.asarray(anchor_joint_values, dtype=np.float64)
+        self.fixed_goal_anchor_route_indices = [
+            int(v) for v in self.get_parameter("fixed_goal_anchor_route_indices").value
+        ]
+        if self.fixed_goal_anchor_routing_enabled:
+            (
+                self.fixed_goal_joint_sequence,
+                self.fixed_goal_joint_sequence_labels,
+            ) = self._anchor_routed_joint_sequence(
+                self.fixed_goal_joint_positions,
+                self.fixed_goal_anchor_joint_position,
+                self.fixed_goal_anchor_route_indices,
+            )
+        else:
+            self.fixed_goal_joint_sequence = self._goal_sequence_with_optional_return(
+                self.fixed_goal_joint_positions
+            )
+            self.fixed_goal_joint_sequence_labels = [
+                f"goal {index + 1}"
+                for index in range(len(self.fixed_goal_joint_sequence))
+            ]
         self.fixed_goal_points_frame = str(self.get_parameter("fixed_goal_points_frame").value)
-        fixed_goal_xyz = [float(v) for v in self.get_parameter("fixed_goal_points_xyz").value]
+        fixed_goal_xyz_csv = str(self.get_parameter("fixed_goal_points_xyz_csv").value).strip()
+        if fixed_goal_xyz_csv:
+            fixed_goal_xyz = [
+                float(v.strip()) for v in fixed_goal_xyz_csv.replace(";", ",").split(",") if v.strip()
+            ]
+        else:
+            fixed_goal_xyz = [float(v) for v in self.get_parameter("fixed_goal_points_xyz").value]
+        if len(fixed_goal_xyz) % 3 != 0:
+            raise ValueError(f"fixed_goal_points_xyz must contain a multiple of 3 values, got {len(fixed_goal_xyz)}")
         self.fixed_goal_points_xyz = np.asarray(fixed_goal_xyz, dtype=np.float64).reshape(-1, 3)
         self.fixed_goal_points_sequence = self._goal_sequence_with_optional_return(self.fixed_goal_points_xyz)
         self.fixed_goal_reached_tolerance_rad = float(self.get_parameter("fixed_goal_reached_tolerance_rad").value)
+        self.fixed_goal_settle_s = max(0.0, float(self.get_parameter("fixed_goal_settle_s").value))
         self.goal_view_standoff_m = [float(v) for v in self.get_parameter("goal_view_standoff_m").value]
         self.goal_view_vertical_offsets_m = [float(v) for v in self.get_parameter("goal_view_vertical_offsets_m").value]
         self.goal_view_lateral_offsets_m = [float(v) for v in self.get_parameter("goal_view_lateral_offsets_m").value]
         self.goal_camera_alignment_min = float(self.get_parameter("goal_camera_alignment_min").value)
         self.goal_candidate_clearance_min_m = float(self.get_parameter("goal_candidate_clearance_min_m").value)
         self.goal_tool_forward_alignment_min = float(self.get_parameter("goal_tool_forward_alignment_min").value)
+        self.goal_candidate_sweep_enabled = bool(self.get_parameter("goal_candidate_sweep_enabled").value)
+        self.goal_candidate_sweep_execute_best = bool(self.get_parameter("goal_candidate_sweep_execute_best").value)
+        self.goal_candidate_sweep_save_path = str(self.get_parameter("goal_candidate_sweep_save_path").value).strip()
+        self.goal_candidate_execute_indices = self._parse_int_csv(
+            str(self.get_parameter("goal_candidate_execute_indices_csv").value)
+        )
+        self.goal_candidate_execute_return_startup = bool(
+            self.get_parameter("goal_candidate_execute_return_startup").value
+        )
         self.path_shortcut_max_passes = int(self.get_parameter("path_shortcut_max_passes").value)
         self.path_shortcut_interp_step_rad = float(self.get_parameter("path_shortcut_interp_step_rad").value)
         self.goal_tool_orientation_yaw_offsets_rad = [
@@ -235,6 +423,9 @@ class FieldPathTest(Node):
         self.scene_boxes = self._parse_scene_boxes(self.get_parameter("scene_boxes").value)
         scene_boxes_frame = str(self.get_parameter("scene_boxes_frame").value)
         self.scene_boxes_frame = scene_boxes_frame if scene_boxes_frame else self.base_frame
+        self.support_boxes = self._parse_scene_boxes(self.get_parameter("support_boxes").value)
+        support_boxes_frame = str(self.get_parameter("support_boxes_frame").value)
+        self.support_boxes_frame = support_boxes_frame if support_boxes_frame else self.base_frame
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -242,12 +433,50 @@ class FieldPathTest(Node):
         self.field_model = ArmFieldModel(self.model_dir)
         self.field_model.load_checkpoint(self._resolve_checkpoint())
         self.planner = ArmFieldPlanner(self.field_model, self.kinematics)
+        self.rrt_planner = JointSpaceRRTConnectPlanner(self.kinematics)
+        self.planner.set_score_weights(
+            joint_edge=self.field_path_joint_edge_weight,
+            tool_edge=self.field_path_tool_edge_weight,
+            tool_goal=self.field_path_tool_goal_weight,
+            clearance_penalty=self.field_path_clearance_penalty_weight,
+            clearance_soft_margin_m=self.field_path_clearance_soft_margin_m,
+            return_first_goal=self.field_path_return_first_goal,
+            forward_probe_fraction=self.field_path_forward_probe_fraction,
+            cartesian_candidate_count=self.field_cartesian_candidate_count,
+            cartesian_candidate_step_m=self.field_cartesian_candidate_step_m,
+            cartesian_candidate_damping=self.field_cartesian_candidate_damping,
+            cartesian_shortcut_enabled=self.cartesian_shortcut_enabled,
+            cartesian_shortcut_tool_weight=self.cartesian_shortcut_tool_weight,
+            cartesian_shortcut_joint_weight=self.cartesian_shortcut_joint_weight,
+            cartesian_shortcut_smoothness_weight=self.cartesian_shortcut_smoothness_weight,
+            cartesian_shortcut_min_improvement=self.cartesian_shortcut_min_improvement,
+            cartesian_shortcut_max_skip=self.cartesian_shortcut_max_skip,
+            cartesian_shortcut_try_reverse=self.cartesian_shortcut_try_reverse,
+        )
         self.get_logger().info(
             "Field test planner config: "
-            f"mode={self.planner_mode} clearance_backend={self.clearance_backend} "
+            f"type={self.planner_type} mode={self.planner_mode} clearance_backend={self.clearance_backend} "
             f"direct_edge={self.planner_direct_edge} shortcut={self.planner_shortcut} "
+            f"rrt_step_size_q={self.rrt_step_size_q:.3f} rrt_max_iters={self.rrt_max_iters} "
+            f"rrt_edge_check_step_rad={self.rrt_edge_check_step_rad:.3f} "
+            f"collision_aware_rollout={self.collision_aware_field_rollout} "
+            f"collision_validation={self.trajectory_collision_validation_enabled} "
             f"step_size_q={self.step_size_q:.4f} rollout_max_steps={self.rollout_max_steps} "
-            f"collision_margin_m={self.trajectory_collision_margin_m:.4f}"
+            f"collision_margin_m={self.trajectory_collision_margin_m:.4f} "
+            f"path_joint_w={self.field_path_joint_edge_weight:.3f} "
+            f"path_tool_edge_w={self.field_path_tool_edge_weight:.3f} "
+            f"path_tool_goal_w={self.planner.path_tool_goal_weight:.3f} "
+            f"path_clearance_w={self.field_path_clearance_penalty_weight:.3f} "
+            f"path_return_first_goal={self.field_path_return_first_goal} "
+            f"path_forward_probe_fraction={self.field_path_forward_probe_fraction:.2f} "
+            f"cart_candidate_count={self.field_cartesian_candidate_count} "
+            f"cart_candidate_step_m={self.field_cartesian_candidate_step_m:.3f} "
+            f"cart_graph_tool_edge_w={self.cartesian_graph_tool_edge_weight:.3f} "
+            f"cart_graph_tool_goal_w={self.cartesian_graph_tool_goal_weight:.3f} "
+            f"cartesian_shortcut={self.cartesian_shortcut_enabled} "
+            f"cart_try_reverse={self.cartesian_shortcut_try_reverse} "
+            f"cart_tool_w={self.cartesian_shortcut_tool_weight:.3f} "
+            f"cart_joint_w={self.cartesian_shortcut_joint_weight:.3f}"
         )
         self.robot_self_filter_checker = UR5PointCloudCollisionChecker(
             self.kinematics, np.zeros((0, 3), dtype=np.float32)
@@ -257,6 +486,7 @@ class FieldPathTest(Node):
         self.latest_depth: np.ndarray | None = None
         self.latest_camera_pose: np.ndarray | None = None
         self.cached_collision_points: np.ndarray | None = None
+        self.saved_collision_points = self._load_saved_collision_points(self.collision_cloud_path)
         self.current_joints: np.ndarray | None = None
         self.startup_pose_reached = False
         self.startup_pose_reached_since: float | None = None
@@ -268,6 +498,10 @@ class FieldPathTest(Node):
         self.pending_clicked_goal_base: np.ndarray | None = None
         self.fixed_goal_index = 0
         self.active_goal_q: np.ndarray | None = None
+        self.active_goal_reached_since: float | None = None
+        self.fixed_goal_candidate_joint_sequence: np.ndarray | None = None
+        self.fixed_goal_candidate_joint_labels: list[str] = []
+        self.last_goal_sweep_completed = False
         self.fixed_goal_markers: MarkerArray | None = None
         self.fixed_goal_markers_logged = False
         self.last_validation_min_idx = -1
@@ -291,8 +525,20 @@ class FieldPathTest(Node):
                 self.get_logger().info(
                     f"Fixed joint-space goal sequence enabled with {len(self.fixed_goal_joint_positions)} unique goals "
                     f"and {len(self.fixed_goal_joint_sequence)} trajectory legs: "
-                    f"{np.round(self.fixed_goal_joint_positions, 3).tolist()}"
+                    f"labels={self.fixed_goal_joint_sequence_labels} "
+                    f"goals={np.round(self.fixed_goal_joint_positions, 3).tolist()}"
                 )
+                if self.fixed_goal_anchor_routing_enabled:
+                    anchor_camera = self.kinematics.tool_to_camera_pose(
+                        self.kinematics.fk(self.fixed_goal_anchor_joint_position),
+                        self.camera_in_tool,
+                    )[:3, 3]
+                    self.get_logger().info(
+                        "Cabinet anchor routing enabled: "
+                        f"anchor_q={np.round(self.fixed_goal_anchor_joint_position, 3).tolist()} "
+                        f"anchor_camera_base_xyz={np.round(anchor_camera, 3).tolist()} "
+                        f"route={self.fixed_goal_anchor_route_indices}"
+                    )
             else:
                 self.get_logger().info(
                     f"Fixed tool-point goal sequence enabled with {len(self.fixed_goal_points_xyz)} unique goals "
@@ -308,6 +554,15 @@ class FieldPathTest(Node):
                 f"Mode={self.interactive_goal_mode}. Use RViz 'Publish Point' to test the learned field "
                 "against a chosen target."
             )
+
+    @staticmethod
+    def _parse_int_csv(text: str) -> list[int]:
+        out: list[int] = []
+        for part in str(text).replace(";", ",").split(","):
+            part = part.strip()
+            if part:
+                out.append(int(part))
+        return out
 
     def _resolve_checkpoint(self) -> Path:
         if self.checkpoint_path.exists():
@@ -500,21 +755,26 @@ class FieldPathTest(Node):
                 boxes.append(np.asarray(values, dtype=np.float64))
         return boxes
 
-    def _scene_boxes_in_base(self) -> np.ndarray:
-        if not self.scene_boxes:
+    def _boxes_in_base(
+        self,
+        boxes: list[np.ndarray],
+        source_frame: str,
+        label: str,
+    ) -> np.ndarray:
+        if not boxes:
             return np.zeros((0, 6), dtype=np.float64)
         tf_m = np.eye(4, dtype=np.float64)
-        if self.scene_boxes_frame != self.base_frame:
+        if source_frame != self.base_frame:
             try:
-                tf = self.tf_buffer.lookup_transform(self.base_frame, self.scene_boxes_frame, rclpy.time.Time())
+                tf = self.tf_buffer.lookup_transform(self.base_frame, source_frame, rclpy.time.Time())
                 tf_m = _transform_to_matrix(tf)
             except TransformException as exc:
                 self.get_logger().warn(
-                    f"Scene box TF lookup failed ({self.scene_boxes_frame} -> {self.base_frame}): {exc}"
+                    f"{label} box TF lookup failed ({source_frame} -> {self.base_frame}): {exc}"
                 )
                 return np.zeros((0, 6), dtype=np.float64)
         out = []
-        for box in self.scene_boxes:
+        for box in boxes:
             center = np.asarray(box[:3], dtype=np.float64)
             size = np.maximum(np.asarray(box[3:], dtype=np.float64), 0.0)
             lo = center - 0.5 * size
@@ -534,11 +794,26 @@ class FieldPathTest(Node):
             out.append(np.concatenate((0.5 * (base_lo + base_hi), np.maximum(base_hi - base_lo, 1e-6))))
         return np.asarray(out, dtype=np.float64)
 
+    def _scene_boxes_in_base(self) -> np.ndarray:
+        return self._boxes_in_base(self.scene_boxes, self.scene_boxes_frame, "Scene")
+
+    def _support_boxes_in_base(self) -> np.ndarray:
+        return self._boxes_in_base(self.support_boxes, self.support_boxes_frame, "Support")
+
     def _make_collision_checker(self, occupied_points: np.ndarray) -> UR5PointCloudCollisionChecker:
+        scene_boxes = self._scene_boxes_in_base()
+        support_boxes = self._support_boxes_in_base()
+        if len(scene_boxes) and len(support_boxes):
+            box_obstacles = np.concatenate((scene_boxes, support_boxes), axis=0)
+        elif len(scene_boxes):
+            box_obstacles = scene_boxes
+        else:
+            box_obstacles = support_boxes
         return make_ur5_collision_checker(
             self.kinematics,
             occupied_points,
-            box_obstacles=self._scene_boxes_in_base(),
+            box_obstacles=box_obstacles,
+            support_box_count=len(support_boxes),
             clearance_backend=self.clearance_backend,
             sdf_voxel_size_m=self.sdf_voxel_size_m,
             sdf_padding_m=self.sdf_padding_m,
@@ -588,6 +863,8 @@ class FieldPathTest(Node):
         return np.asarray(spheres, dtype=np.float64).reshape(-1, 4)
 
     def _current_collision_points(self, q_start: np.ndarray, context: str) -> tuple[np.ndarray | None, int, int, bool]:
+        if self.saved_collision_points is not None and len(self.saved_collision_points):
+            return self.saved_collision_points, int(len(self.saved_collision_points)), 0, True
         if self.latest_depth is None or self.latest_info is None or self.latest_camera_pose is None:
             return None, 0, 0, False
         points_world = self._depth_to_world(self.latest_depth, self.latest_info, self.latest_camera_pose)
@@ -611,6 +888,26 @@ class FieldPathTest(Node):
             f"with {len(cached)} points."
         )
         return cached, raw_point_count, 0, True
+
+    def _load_saved_collision_points(self, configured_path: str) -> np.ndarray | None:
+        if not configured_path:
+            return None
+        path = Path(configured_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"collision_cloud_path does not exist: {path}")
+        if path.suffix.lower() == ".npy":
+            points = np.load(path)
+        else:
+            with np.load(path) as data:
+                if "occupied_points" not in data:
+                    raise KeyError(f"Saved cloud {path} has no 'occupied_points' array")
+                points = data["occupied_points"]
+        points = np.asarray(points, dtype=np.float32).reshape(-1, 3)
+        points = points[np.all(np.isfinite(points), axis=1)]
+        if len(points) == 0:
+            raise ValueError(f"Saved collision cloud is empty: {path}")
+        self.get_logger().info(f"Loaded saved collision cloud: path={path} points={len(points)}")
+        return points
 
     def _resolve_sample_file(self) -> Path:
         candidates = sorted(self.samples_dir.glob("step_*.npz"))
@@ -645,6 +942,39 @@ class FieldPathTest(Node):
             return arr.copy()
         return np.concatenate((arr, arr[:1].copy()), axis=0)
 
+    @staticmethod
+    def _anchor_routed_joint_sequence(
+        goals: np.ndarray,
+        anchor: np.ndarray,
+        route_indices: list[int],
+    ) -> tuple[np.ndarray, list[str]]:
+        """Expand a compact goal/anchor route into executable joint targets.
+
+        Route index 0 denotes the free-space cabinet anchor. Positive indices
+        are one-based indices into ``goals``. This keeps route topology out of
+        the learned planner and makes the requested G1-A-G2-G3-A-G1 sequence
+        explicit in configuration.
+        """
+        goal_rows = np.asarray(goals, dtype=np.float64).reshape(-1, 6)
+        anchor_q = np.asarray(anchor, dtype=np.float64).reshape(6)
+        sequence: list[np.ndarray] = []
+        labels: list[str] = []
+        for route_index in route_indices:
+            index = int(route_index)
+            if index == 0:
+                sequence.append(anchor_q.copy())
+                labels.append("cabinet transition anchor")
+                continue
+            if index < 1 or index > len(goal_rows):
+                raise ValueError(
+                    f"fixed_goal_anchor_route_indices contains {index}; valid values are 0..{len(goal_rows)}"
+                )
+            sequence.append(goal_rows[index - 1].copy())
+            labels.append(f"goal {index}")
+        if not sequence:
+            raise ValueError("fixed_goal_anchor_route_indices must not be empty when anchor routing is enabled")
+        return np.asarray(sequence, dtype=np.float64), labels
+
     def _clicked_goal_cb(self, msg: PointStamped):
         xyz = np.array([msg.point.x, msg.point.y, msg.point.z], dtype=np.float64)
         frame = msg.header.frame_id if msg.header.frame_id else self.visualization_frame
@@ -673,6 +1003,16 @@ class FieldPathTest(Node):
                 np.asarray(self.kinematics.fk(q)[:3, 3], dtype=np.float64)
                 for q in self.fixed_goal_joint_positions
             ]
+            if self.fixed_goal_anchor_routing_enabled:
+                goal_points_base.append(
+                    np.asarray(
+                        self.kinematics.tool_to_camera_pose(
+                            self.kinematics.fk(self.fixed_goal_anchor_joint_position),
+                            self.camera_in_tool,
+                        )[:3, 3],
+                        dtype=np.float64,
+                    )
+                )
         else:
             goal_points_base = []
             for xyz_src in self.fixed_goal_points_xyz:
@@ -754,35 +1094,57 @@ class FieldPathTest(Node):
     def _run_fixed_goal_sequence(self):
         if self.current_joints is None:
             return
-        goals = self.fixed_goal_joint_sequence if self.fixed_goal_mode == "joint" else self.fixed_goal_points_sequence
+        if self.fixed_goal_mode == "point_candidate_sequence":
+            if self.fixed_goal_candidate_joint_sequence is None:
+                if not self._prepare_fixed_point_candidate_sequence():
+                    self.completed = True
+                    return
+            goals = self.fixed_goal_candidate_joint_sequence
+        else:
+            goals = self.fixed_goal_joint_sequence if self.fixed_goal_mode == "joint" else self.fixed_goal_points_sequence
         if self.active_goal_q is not None:
             err = np.max(np.abs(np.asarray(self.current_joints, dtype=np.float64) - self.active_goal_q))
             if err <= self.fixed_goal_reached_tolerance_rad:
+                now = self.get_clock().now().nanoseconds * 1.0e-9
+                if self.active_goal_reached_since is None:
+                    self.active_goal_reached_since = now
+                    return
+                if now - self.active_goal_reached_since < self.fixed_goal_settle_s:
+                    return
                 self.get_logger().info(
                     f"Reached fixed goal {self.fixed_goal_index}/{len(goals)} within "
-                    f"{self.fixed_goal_reached_tolerance_rad:.3f} rad."
+                    f"{self.fixed_goal_reached_tolerance_rad:.3f} rad and settled for "
+                    f"{self.fixed_goal_settle_s:.2f}s."
                 )
                 self.active_goal_q = None
+                self.active_goal_reached_since = None
             else:
+                self.active_goal_reached_since = None
                 return
         if self.fixed_goal_index >= len(goals):
             if not self.completed:
                 self.completed = True
                 self.get_logger().info("Fixed field-goal sequence complete.")
             return
-        if self.fixed_goal_mode == "joint":
-            target_q = np.asarray(self.fixed_goal_joint_sequence[self.fixed_goal_index], dtype=np.float64)
+        if self.fixed_goal_mode in ("joint", "point_candidate_sequence"):
+            target_q = np.asarray(goals[self.fixed_goal_index], dtype=np.float64)
+            if self.fixed_goal_mode == "point_candidate_sequence" and self.fixed_goal_index < len(self.fixed_goal_candidate_joint_labels):
+                label = self.fixed_goal_candidate_joint_labels[self.fixed_goal_index]
+            else:
+                route_label = self.fixed_goal_joint_sequence_labels[self.fixed_goal_index]
+                label = f"fixed joint {route_label} ({self.fixed_goal_index + 1}/{len(goals)})"
             self.get_logger().info(
-                f"Planning fixed joint goal {self.fixed_goal_index + 1}/{len(goals)} "
+                f"Planning {label} "
                 f"goal_q={np.round(target_q, 3).tolist()}"
             )
-            self.active_goal_label = f"fixed joint goal {self.fixed_goal_index + 1}/{len(goals)}"
+            self.active_goal_label = label
             goal_q = self._run_to_joint_goal(target_q)
             if goal_q is None:
-                self.get_logger().warn(f"Failed to plan fixed joint goal {self.fixed_goal_index + 1}/{len(goals)}.")
+                self.get_logger().warn(f"Failed to plan {label}.")
                 self.completed = True
                 return
             self.active_goal_q = goal_q
+            self.active_goal_reached_since = None
             self.fixed_goal_index += 1
             return
         target_src = self.fixed_goal_points_sequence[self.fixed_goal_index]
@@ -797,13 +1159,88 @@ class FieldPathTest(Node):
         self.active_goal_label = f"fixed goal {self.fixed_goal_index + 1}/{len(goals)}"
         goal_q = self._run_to_target_point(target_base)
         if goal_q is None:
+            if self.goal_candidate_sweep_enabled and self.last_goal_sweep_completed:
+                self.fixed_goal_index += 1
+                return
             self.get_logger().warn(
                 f"Failed to plan fixed goal {self.fixed_goal_index + 1}/{len(goals)}."
             )
             self.completed = True
             return
         self.active_goal_q = goal_q
+        self.active_goal_reached_since = None
         self.fixed_goal_index += 1
+
+    def _prepare_fixed_point_candidate_sequence(self) -> bool:
+        if self.current_joints is None:
+            return False
+        if len(self.fixed_goal_points_sequence) == 0:
+            self.get_logger().warn("point_candidate_sequence requested but no fixed_goal_points_xyz target was provided.")
+            return False
+        if not self.goal_candidate_execute_indices:
+            self.get_logger().warn(
+                "point_candidate_sequence requires goal_candidate_execute_indices_csv, e.g. '16,22,27'."
+            )
+            return False
+        target_src = self.fixed_goal_points_sequence[0]
+        target_base = self._transform_point_between_frames(target_src, self.fixed_goal_points_frame, self.base_frame)
+        if target_base is None:
+            return False
+        q_start = np.asarray(self.current_joints, dtype=np.float64).copy()
+        points_world, raw_point_count, self_removed, used_cached_cloud = self._current_collision_points(
+            q_start, "fixed point candidate sequence setup"
+        )
+        if points_world is None:
+            return False
+        checker = self._make_collision_checker(points_world)
+        candidate_t0 = time.perf_counter()
+        candidates = self._candidate_tool_point_goal_states(checker, q_start, target_base)
+        candidates = self._dedupe_goal_candidates(candidates)
+        candidate_ms = (time.perf_counter() - candidate_t0) * 1e3
+        if not candidates:
+            self.get_logger().warn(
+                f"No feasible tool-point candidates for point_candidate_sequence target={np.round(target_base, 3).tolist()}"
+            )
+            return False
+        max_idx = len(candidates)
+        selected: list[np.ndarray] = []
+        labels: list[str] = []
+        for order, candidate_idx in enumerate(self.goal_candidate_execute_indices, start=1):
+            if candidate_idx < 1 or candidate_idx > max_idx:
+                self.get_logger().warn(
+                    f"Requested candidate index {candidate_idx} is outside available range 1..{max_idx}."
+                )
+                return False
+            q_goal, actual_pose, score, clearance = candidates[candidate_idx - 1]
+            selected.append(np.asarray(q_goal, dtype=np.float64))
+            labels.append(
+                f"candidate {candidate_idx} run {order}/{len(self.goal_candidate_execute_indices)}"
+            )
+            self.get_logger().info(
+                f"Selected point candidate index={candidate_idx} run={order}/{len(self.goal_candidate_execute_indices)} "
+                f"goal_q={np.round(q_goal, 3).tolist()} tool_xyz={np.round(actual_pose[:3, 3], 3).tolist()} "
+                f"candidate_score={float(score):.3f} goal_clearance_m={float(clearance):.4f}"
+            )
+
+        sequence: list[np.ndarray] = []
+        sequence_labels: list[str] = []
+        for idx, (q_goal, label) in enumerate(zip(selected, labels), start=1):
+            sequence.append(q_goal)
+            sequence_labels.append(label)
+            if self.goal_candidate_execute_return_startup and idx < len(selected):
+                sequence.append(np.asarray(self.startup_positions, dtype=np.float64).copy())
+                sequence_labels.append(f"return to startup after candidate {self.goal_candidate_execute_indices[idx - 1]}")
+        self.fixed_goal_candidate_joint_sequence = np.asarray(sequence, dtype=np.float64).reshape(-1, 6)
+        self.fixed_goal_candidate_joint_labels = sequence_labels
+        self.get_logger().info(
+            "Prepared fixed point candidate execution sequence: "
+            f"target_src={np.round(target_src, 3).tolist()} target_base={np.round(target_base, 3).tolist()} "
+            f"requested_indices={self.goal_candidate_execute_indices} "
+            f"sequence_legs={len(self.fixed_goal_candidate_joint_sequence)} "
+            f"raw_points={raw_point_count} self_removed={self_removed} used_cached_cloud={used_cached_cloud} "
+            f"collision_points={len(points_world)} candidate_ms={candidate_ms:.1f}"
+        )
+        return True
 
     def _segment_collision_free(
         self, checker: UR5PointCloudCollisionChecker, qa: np.ndarray, qb: np.ndarray, margin_m: float | None = None
@@ -841,6 +1278,54 @@ class FieldPathTest(Node):
                         break
                 if next_idx > idx + 1:
                     changed = True
+                shortcut.append(cur[next_idx].copy())
+                idx = next_idx
+            cur = np.asarray(shortcut, dtype=np.float64)
+            if not changed:
+                break
+        return cur.astype(np.float32)
+
+    def _segment_field_safe(
+        self,
+        qa: np.ndarray,
+        qb: np.ndarray,
+        q_goal: np.ndarray,
+    ) -> bool:
+        """Check a shortcut using only dense learned-speed inference."""
+        qa = np.asarray(qa, dtype=np.float64).reshape(6)
+        qb = np.asarray(qb, dtype=np.float64).reshape(6)
+        q_goal_n = self.kinematics.normalize(np.asarray(q_goal, dtype=np.float64)).astype(np.float32)
+        max_step = max(0.01, self.path_shortcut_interp_step_rad)
+        count = max(1, int(np.ceil(float(np.max(np.abs(qb - qa))) / max_step)))
+        q = np.linspace(qa, qb, count + 1, dtype=np.float64)
+        qn = np.asarray([self.kinematics.normalize(row) for row in q], dtype=np.float32)
+        goals = np.repeat(q_goal_n[None, :], len(qn), axis=0)
+        pred, _ = self.field_model.predict_normalized_pair_speeds(qn, goals, batch_size=2048)
+        return bool(
+            len(pred) == len(qn)
+            and np.all(np.isfinite(pred))
+            and float(np.min(pred)) >= self.learned_speed_search_min_speed
+        )
+
+    def _shortcut_plan_field_only(self, plan: np.ndarray, q_goal: np.ndarray) -> np.ndarray:
+        """Greedily shortcut a raw field path without geometric queries."""
+        pts = np.asarray(plan, dtype=np.float64)
+        if pts.ndim != 2 or len(pts) <= 2 or not self.planner_shortcut:
+            return pts.astype(np.float32)
+        if self.path_shortcut_max_passes <= 0:
+            return pts.astype(np.float32)
+        cur = pts.copy()
+        for _ in range(self.path_shortcut_max_passes):
+            shortcut = [cur[0].copy()]
+            idx = 0
+            changed = False
+            while idx < len(cur) - 1:
+                next_idx = idx + 1
+                for candidate_idx in range(len(cur) - 1, idx, -1):
+                    if self._segment_field_safe(cur[idx], cur[candidate_idx], q_goal):
+                        next_idx = candidate_idx
+                        break
+                changed = changed or next_idx > idx + 1
                 shortcut.append(cur[next_idx].copy())
                 idx = next_idx
             cur = np.asarray(shortcut, dtype=np.float64)
@@ -1040,7 +1525,50 @@ class FieldPathTest(Node):
         pred0, _pred1 = self.field_model.predict_normalized_pair_speeds(q0n, q1n)
         return float(pred0[0]) if len(pred0) and np.isfinite(pred0[0]) else -1.0
 
+    def _save_goal_candidate_sweep(
+        self,
+        target: np.ndarray,
+        q_start: np.ndarray,
+        results: list[dict[str, object]],
+    ) -> None:
+        if not self.goal_candidate_sweep_save_path:
+            return
+        path = Path(self.goal_candidate_sweep_save_path).expanduser()
+        if path.is_dir() or str(path).endswith("/"):
+            safe_label = self.active_goal_label.replace(" ", "_").replace("/", "_")
+            path = path / f"{safe_label}_candidate_sweep.npz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        q_goals = np.asarray([r["q_goal"] for r in results], dtype=np.float64)
+        tool_poses = np.asarray([r["tool_pose"] for r in results], dtype=np.float64)
+        np.savez_compressed(
+            path,
+            target=np.asarray(target, dtype=np.float64),
+            q_start=np.asarray(q_start, dtype=np.float64),
+            candidate_index=np.asarray([r["candidate_index"] for r in results], dtype=np.int32),
+            candidate_score=np.asarray([r["candidate_score"] for r in results], dtype=np.float64),
+            q_goal=q_goals,
+            tool_pose=tool_poses,
+            goal_clearance_m=np.asarray([r["goal_clearance_m"] for r in results], dtype=np.float64),
+            field_speed_start=np.asarray([r["field_speed_start"] for r in results], dtype=np.float64),
+            field_speed_goal=np.asarray([r["field_speed_goal"] for r in results], dtype=np.float64),
+            field_goal_nbhd_mean=np.asarray([r["field_goal_nbhd_mean"] for r in results], dtype=np.float64),
+            field_goal_nbhd_min=np.asarray([r["field_goal_nbhd_min"] for r in results], dtype=np.float64),
+            precheck_ok=np.asarray([r["precheck_ok"] for r in results], dtype=bool),
+            path_ok=np.asarray([r["path_ok"] for r in results], dtype=bool),
+            planner_status=np.asarray([r["planner_status"] for r in results], dtype=object),
+            raw_waypoints=np.asarray([r["raw_waypoints"] for r in results], dtype=np.int32),
+            plan_waypoints=np.asarray([r["plan_waypoints"] for r in results], dtype=np.int32),
+            raw_len=np.asarray([r["raw_len"] for r in results], dtype=np.float64),
+            plan_len=np.asarray([r["plan_len"] for r in results], dtype=np.float64),
+            path_clearance_m=np.asarray([r["path_clearance_m"] for r in results], dtype=np.float64),
+            min_q_field_speed=np.asarray([r["min_q_field_speed"] for r in results], dtype=np.float64),
+            plan_ms=np.asarray([r["plan_ms"] for r in results], dtype=np.float64),
+            validate_ms=np.asarray([r["validate_ms"] for r in results], dtype=np.float64),
+        )
+        self.get_logger().info(f"Wrote goal candidate sweep results: {path}")
+
     def _run_to_target_point(self, target: np.ndarray) -> np.ndarray | None:
+        self.last_goal_sweep_completed = False
         if self.latest_depth is None or self.latest_info is None:
             return None
         if self.current_joints is None:
@@ -1086,37 +1614,50 @@ class FieldPathTest(Node):
         best_goal = None
         best_clearance = -1.0
         best_goal_pose = None
+        best_valid_len = float("inf")
+        sweep_results: list[dict[str, object]] = []
         found_valid_path = False
-        for idx, (q_goal, actual_pose, _, goal_clearance) in enumerate(candidates[: self.max_goal_candidates], start=1):
+        max_candidates = min(len(candidates), self.max_goal_candidates)
+        for idx, (q_goal, actual_pose, candidate_score, goal_clearance) in enumerate(candidates[: self.max_goal_candidates], start=1):
             field_diag = self._field_candidate_precheck(q_start, q_goal)
             if not bool(field_diag.get("ok", True)):
                 self.get_logger().info(
-                    f"{self.active_goal_label} candidate={idx}/{min(len(candidates), self.max_goal_candidates)} "
+                    f"{self.active_goal_label} candidate={idx}/{max_candidates} "
                     f"rejected by field precheck: goal_q={np.round(q_goal, 3).tolist()} "
                     f"field_speed_start={float(field_diag.get('field_speed_start', -1.0)):.4f} "
                     f"field_speed_goal={float(field_diag.get('field_speed_goal', -1.0)):.4f} "
                     f"field_goal_nbhd_mean={float(field_diag.get('field_goal_nbhd_mean', -1.0)):.4f} "
                     f"field_goal_nbhd_min={float(field_diag.get('field_goal_nbhd_min', -1.0)):.4f}"
                 )
+                sweep_results.append(
+                    {
+                        "candidate_index": idx,
+                        "candidate_score": float(candidate_score),
+                        "q_goal": np.asarray(q_goal, dtype=np.float64),
+                        "tool_pose": np.asarray(actual_pose, dtype=np.float64),
+                        "goal_clearance_m": float(goal_clearance),
+                        "field_speed_start": float(field_diag.get("field_speed_start", -1.0)),
+                        "field_speed_goal": float(field_diag.get("field_speed_goal", -1.0)),
+                        "field_goal_nbhd_mean": float(field_diag.get("field_goal_nbhd_mean", -1.0)),
+                        "field_goal_nbhd_min": float(field_diag.get("field_goal_nbhd_min", -1.0)),
+                        "precheck_ok": False,
+                        "path_ok": False,
+                        "planner_status": "field_precheck_failed",
+                        "raw_waypoints": 0,
+                        "plan_waypoints": 0,
+                        "raw_len": 0.0,
+                        "plan_len": 0.0,
+                        "path_clearance_m": -1.0,
+                        "min_q_field_speed": -1.0,
+                        "plan_ms": 0.0,
+                        "validate_ms": 0.0,
+                    }
+                )
                 continue
             plan_t0 = time.perf_counter()
-            if self.collision_aware_field_rollout:
-                raw_plan = self.planner.plan_collision_aware(
-                    checker,
-                    q_start,
-                    q_goal,
-                    self.step_size_q,
-                    self.rollout_max_steps,
-                    clearance_margin_m=self.trajectory_collision_margin_m,
-                    max_local_candidates=self.field_local_rollout_candidates,
-                    allow_direct_edge=self.planner_direct_edge,
-                    shortcut_path=self.planner_shortcut,
-                )
-            else:
-                raw_plan = self.planner.plan(
-                    q_start, q_goal, self.step_size_q, self.rollout_max_steps, mode=self.planner_mode
-                )
+            raw_plan = self._plan_field_path(checker, q_start, q_goal)
             plan_ms = (time.perf_counter() - plan_t0) * 1e3
+            planner_debug = dict(getattr(self.planner, "last_debug", {}))
             validate_t0 = time.perf_counter()
             shortcut_plan = self._shortcut_plan(checker, raw_plan)
             path_ok, min_clearance = self._validate_plan_collision(checker, shortcut_plan)
@@ -1124,8 +1665,32 @@ class FieldPathTest(Node):
             validate_ms = (time.perf_counter() - validate_t0) * 1e3
             raw_len = self._plan_length(raw_plan)
             short_len = self._plan_length(shortcut_plan)
+            sweep_results.append(
+                {
+                    "candidate_index": idx,
+                    "candidate_score": float(candidate_score),
+                    "q_goal": np.asarray(q_goal, dtype=np.float64),
+                    "tool_pose": np.asarray(actual_pose, dtype=np.float64),
+                    "goal_clearance_m": float(goal_clearance),
+                    "field_speed_start": float(field_diag.get("field_speed_start", -1.0)),
+                    "field_speed_goal": float(field_diag.get("field_speed_goal", -1.0)),
+                    "field_goal_nbhd_mean": float(field_diag.get("field_goal_nbhd_mean", -1.0)),
+                    "field_goal_nbhd_min": float(field_diag.get("field_goal_nbhd_min", -1.0)),
+                    "precheck_ok": True,
+                    "path_ok": bool(path_ok),
+                    "planner_status": str(planner_debug.get("status", "")),
+                    "raw_waypoints": int(len(raw_plan)),
+                    "plan_waypoints": int(len(shortcut_plan)),
+                    "raw_len": float(raw_len),
+                    "plan_len": float(short_len),
+                    "path_clearance_m": float(min_clearance),
+                    "min_q_field_speed": float(min_q_field_speed),
+                    "plan_ms": float(plan_ms),
+                    "validate_ms": float(validate_ms),
+                }
+            )
             self.get_logger().info(
-                f"{self.active_goal_label} candidate={idx}/{min(len(candidates), self.max_goal_candidates)} "
+                f"{self.active_goal_label} candidate={idx}/{max_candidates} "
                 f"goal_q={np.round(q_goal, 3).tolist()} raw_waypoints={len(raw_plan)} short_waypoints={len(shortcut_plan)} "
                 f"raw_len={raw_len:.3f} short_len={short_len:.3f} goal_clearance_m={goal_clearance:.4f} "
                 f"field_speed_start={float(field_diag.get('field_speed_start', -1.0)):.4f} "
@@ -1137,18 +1702,34 @@ class FieldPathTest(Node):
                 f"min_clearance_q={np.round(self.last_validation_min_q, 3).tolist() if self.last_validation_min_q is not None else None} "
                 f"plan_ms={plan_ms:.1f} validate_ms={validate_ms:.1f}"
             )
-            if path_ok:
+            if path_ok and (not self.goal_candidate_sweep_enabled):
                 best_plan = shortcut_plan
                 best_goal = q_goal
                 best_clearance = min_clearance
                 best_goal_pose = actual_pose
                 found_valid_path = True
                 break
+            if path_ok and short_len < best_valid_len:
+                best_plan = shortcut_plan
+                best_goal = q_goal
+                best_clearance = min_clearance
+                best_goal_pose = actual_pose
+                best_valid_len = short_len
+                found_valid_path = True
             if min_clearance > best_clearance:
                 best_plan = shortcut_plan
                 best_goal = q_goal
                 best_clearance = min_clearance
                 best_goal_pose = actual_pose
+        if self.goal_candidate_sweep_enabled:
+            valid = [r for r in sweep_results if bool(r["path_ok"])]
+            self.get_logger().info(
+                f"{self.active_goal_label} candidate sweep complete: "
+                f"tested={len(sweep_results)}/{max_candidates} valid_paths={len(valid)} "
+                f"target={np.round(target, 3).tolist()}"
+            )
+            self._save_goal_candidate_sweep(target, q_start, sweep_results)
+            self.last_goal_sweep_completed = True
         if best_plan is None or best_goal is None or best_goal_pose is None:
             self.get_logger().warn("Interactive 3D goal planning could not produce any plan.")
             return None
@@ -1174,9 +1755,111 @@ class FieldPathTest(Node):
         )
         self._publish_goal_markers(q_start, best_goal, target)
         self._publish_planned_path(best_plan)
-        if self.publish_trajectory and self.interactive_execute_on_click:
-            self._publish_joint_trajectory(best_plan)
+        if self.publish_trajectory and self.interactive_execute_on_click and (
+            (not self.goal_candidate_sweep_enabled) or self.goal_candidate_sweep_execute_best
+        ):
+            if not self._publish_joint_trajectory(best_plan, checker=checker):
+                return None
+        if self.goal_candidate_sweep_enabled and not self.goal_candidate_sweep_execute_best:
+            return None
         return np.asarray(best_goal, dtype=np.float64)
+
+    def _plan_field_path(
+        self,
+        checker: UR5PointCloudCollisionChecker,
+        q_start: np.ndarray,
+        q_goal: np.ndarray,
+    ) -> np.ndarray:
+        if self.planner_type in ("rrt", "rrt_connect", "rrtconnect"):
+            return self.rrt_planner.plan(
+                checker,
+                q_start,
+                q_goal,
+                step_size_q=self.rrt_step_size_q,
+                max_iters=self.rrt_max_iters,
+                goal_bias=self.rrt_goal_bias,
+                clearance_margin_m=self.trajectory_collision_margin_m,
+                edge_check_step_rad=self.rrt_edge_check_step_rad,
+            )
+        if not self.collision_aware_field_rollout:
+            if self.planner_type in (
+                "learned_speed_search",
+                "neural_search",
+                "network_search",
+                "field_search",
+            ):
+                return self.planner.plan_learned_speed_search(
+                    q_start,
+                    q_goal,
+                    self.step_size_q,
+                    self.rollout_max_steps,
+                    min_predicted_speed=self.learned_speed_search_min_speed,
+                    max_local_candidates=self.field_local_rollout_candidates,
+                    allow_direct_edge=self.planner_direct_edge,
+                    mode=self.planner_mode,
+                )
+            if self.planner_type not in ("field", "field_only", "raw_field", "gradient"):
+                self.get_logger().error(
+                    f"planner_type={self.planner_type!r} requires collision_aware_field_rollout=true; "
+                    "with collision awareness disabled only the raw gradient field is available. "
+                    "Refusing to silently substitute a different planner."
+                )
+                return np.zeros((0, 6), dtype=np.float32)
+            return self.planner.plan(q_start, q_goal, self.step_size_q, self.rollout_max_steps, mode=self.planner_mode)
+        if self.planner_type in ("sampled", "sampled_rollout", "mppi"):
+            return self.planner.plan_sampled_rollout(
+                checker,
+                q_start,
+                q_goal,
+                self.step_size_q,
+                self.rollout_max_steps,
+                clearance_margin_m=self.trajectory_collision_margin_m,
+                sample_count=self.sampled_rollout_samples,
+                horizon=self.sampled_rollout_horizon,
+                iterations=self.sampled_rollout_iterations,
+                noise_scale=self.sampled_rollout_noise_scale,
+                temperature=self.sampled_rollout_temperature,
+                tau_weight=self.sampled_rollout_tau_weight,
+                goal_dist_weight=self.sampled_rollout_goal_dist_weight,
+                joint_path_weight=self.sampled_rollout_joint_path_weight,
+                tool_path_weight=self.sampled_rollout_tool_path_weight,
+                clearance_penalty_weight=self.sampled_rollout_clearance_penalty_weight,
+                topk_edge_checks=self.sampled_rollout_topk_edge_checks,
+                allow_direct_edge=self.planner_direct_edge,
+                shortcut_path=self.planner_shortcut,
+            )
+        if self.planner_type in ("cartesian_graph", "cart_graph", "tool_graph"):
+            return self.planner.plan_cartesian_graph(
+                checker,
+                q_start,
+                q_goal,
+                self.step_size_q,
+                self.rollout_max_steps,
+                clearance_margin_m=self.trajectory_collision_margin_m,
+                max_local_candidates=self.field_local_rollout_candidates,
+                allow_direct_edge=self.planner_direct_edge,
+                shortcut_path=self.planner_shortcut,
+                mode=self.planner_mode,
+                tool_edge_weight=self.cartesian_graph_tool_edge_weight,
+                tool_goal_weight=self.cartesian_graph_tool_goal_weight,
+                joint_edge_weight=self.cartesian_graph_joint_edge_weight,
+                joint_goal_weight=self.cartesian_graph_joint_goal_weight,
+                tau_weight=self.cartesian_graph_tau_weight,
+                clearance_penalty_weight=self.cartesian_graph_clearance_penalty_weight,
+                clearance_soft_margin_m=self.cartesian_graph_clearance_soft_margin_m,
+            )
+        return self.planner.plan_collision_aware(
+            checker,
+            q_start,
+            q_goal,
+            self.step_size_q,
+            self.rollout_max_steps,
+            clearance_margin_m=self.trajectory_collision_margin_m,
+            max_local_candidates=self.field_local_rollout_candidates,
+            allow_direct_edge=self.planner_direct_edge,
+            shortcut_path=self.planner_shortcut,
+            mode=self.planner_mode,
+        )
 
     def _run_to_joint_goal(self, q_goal: np.ndarray) -> np.ndarray | None:
         if self.latest_depth is None or self.latest_info is None:
@@ -1195,9 +1878,13 @@ class FieldPathTest(Node):
         if points_world is None:
             return None
         checker = self._make_collision_checker(points_world)
-        goal_clearance = float(checker.clearance(q_goal))
+        goal_clearance = (
+            float(checker.clearance(q_goal))
+            if self.trajectory_collision_validation_enabled or self.collision_aware_field_rollout
+            else float("nan")
+        )
         field_diag = self._field_candidate_precheck(q_start, q_goal)
-        if not bool(field_diag.get("ok", True)):
+        if self.planner_type not in ("rrt", "rrt_connect", "rrtconnect") and not bool(field_diag.get("ok", True)):
             self.get_logger().warn(
                 f"{self.active_goal_label} rejected by field precheck: goal_q={np.round(q_goal, 3).tolist()} "
                 f"field_speed_start={float(field_diag.get('field_speed_start', -1.0)):.4f} "
@@ -1207,22 +1894,14 @@ class FieldPathTest(Node):
             )
             return None
         plan_t0 = time.perf_counter()
-        if self.collision_aware_field_rollout:
-            raw_plan = self.planner.plan_collision_aware(
-                checker,
-                q_start,
-                q_goal,
-                self.step_size_q,
-                self.rollout_max_steps,
-                clearance_margin_m=self.trajectory_collision_margin_m,
-                max_local_candidates=self.field_local_rollout_candidates,
-                allow_direct_edge=self.planner_direct_edge,
-                shortcut_path=self.planner_shortcut,
-            )
-        else:
-            raw_plan = self.planner.plan(q_start, q_goal, self.step_size_q, self.rollout_max_steps, mode=self.planner_mode)
+        raw_plan = self._plan_field_path(checker, q_start, q_goal)
         plan_ms = (time.perf_counter() - plan_t0) * 1e3
-        planner_debug = dict(getattr(self.planner, "last_debug", {}))
+        debug_planner = (
+            self.rrt_planner
+            if self.planner_type in ("rrt", "rrt_connect", "rrtconnect")
+            else self.planner
+        )
+        planner_debug = dict(getattr(debug_planner, "last_debug", {}))
         used_direct_fallback = False
         if np.asarray(raw_plan).ndim != 2 or len(raw_plan) == 0:
             if not self.direct_joint_fallback_enabled:
@@ -1239,9 +1918,17 @@ class FieldPathTest(Node):
             )
             raw_plan = self._direct_joint_plan(q_start, q_goal)
         validate_t0 = time.perf_counter()
-        plan = self._shortcut_plan(checker, raw_plan)
-        path_ok, min_clearance = self._validate_plan_collision(checker, plan)
-        min_q_field_speed = self._field_speed_at_waypoint(self.last_validation_min_q, q_goal)
+        if self.trajectory_collision_validation_enabled:
+            plan = self._shortcut_plan(checker, raw_plan)
+            path_ok, min_clearance = self._validate_plan_collision(checker, plan)
+            min_q_field_speed = self._field_speed_at_waypoint(self.last_validation_min_q, q_goal)
+        else:
+            plan = self._shortcut_plan_field_only(raw_plan, q_goal)
+            path_ok = True
+            min_clearance = float("nan")
+            self.last_validation_min_idx = -1
+            self.last_validation_min_q = plan[-1].astype(np.float64).copy() if len(plan) else None
+            min_q_field_speed = self._field_speed_at_waypoint(self.last_validation_min_q, q_goal)
         validate_ms = (time.perf_counter() - validate_t0) * 1e3
         self.get_logger().info(
             f"{self.active_goal_label}: start_q={np.round(q_start, 3).tolist()} "
@@ -1256,6 +1943,7 @@ class FieldPathTest(Node):
             f"min_clearance_q={np.round(self.last_validation_min_q, 3).tolist() if self.last_validation_min_q is not None else None} "
             f"raw_points={raw_point_count} self_removed={self_removed} "
             f"used_cached_cloud={used_cached_cloud} collision_points={len(points_world)} "
+            f"collision_validation_enabled={self.trajectory_collision_validation_enabled} "
             f"used_direct_fallback={used_direct_fallback} planner_debug={planner_debug} "
             f"plan_ms={plan_ms:.1f} validate_ms={validate_ms:.1f}"
         )
@@ -1267,7 +1955,8 @@ class FieldPathTest(Node):
             )
             return None
         if self.publish_trajectory and self.interactive_execute_on_click:
-            self._publish_joint_trajectory(plan)
+            if not self._publish_joint_trajectory(plan, checker=checker):
+                return None
         return q_goal
 
     def _validate_plan_collision(self, checker: UR5PointCloudCollisionChecker, plan: np.ndarray) -> tuple[bool, float]:
@@ -1349,22 +2038,7 @@ class FieldPathTest(Node):
         best_goal = None
         best_clearance = -1.0
         for idx, q_goal in enumerate(valid_goals, start=1):
-            if self.collision_aware_field_rollout:
-                raw_plan = self.planner.plan_collision_aware(
-                    checker,
-                    q_start,
-                    q_goal,
-                    self.step_size_q,
-                    self.rollout_max_steps,
-                    clearance_margin_m=self.trajectory_collision_margin_m,
-                    max_local_candidates=self.field_local_rollout_candidates,
-                    allow_direct_edge=self.planner_direct_edge,
-                    shortcut_path=self.planner_shortcut,
-                )
-            else:
-                raw_plan = self.planner.plan(
-                    q_start, q_goal, self.step_size_q, self.rollout_max_steps, mode=self.planner_mode
-                )
+            raw_plan = self._plan_field_path(checker, q_start, q_goal)
             plan = self._shortcut_plan(checker, raw_plan)
             path_ok, min_clearance = self._validate_plan_collision(checker, plan)
             self.get_logger().info(
@@ -1395,7 +2069,7 @@ class FieldPathTest(Node):
         self._publish_goal_markers(q_start, best_goal, None)
         self._publish_planned_path(best_plan)
         if self.publish_trajectory:
-            self._publish_joint_trajectory(best_plan)
+            self._publish_joint_trajectory(best_plan, checker=checker)
 
     def _wrap_plan_near_start(self, plan: np.ndarray, q_start: np.ndarray) -> np.ndarray:
         pts = np.asarray(plan, dtype=np.float64).copy()
@@ -1523,12 +2197,25 @@ class FieldPathTest(Node):
             path.poses.append(pose)
         self.path_pub.publish(path)
 
-    def _publish_joint_trajectory(self, plan: np.ndarray):
+    def _publish_joint_trajectory(
+        self,
+        plan: np.ndarray,
+        checker: UR5PointCloudCollisionChecker | None = None,
+    ) -> bool:
         current_q = None if self.current_joints is None else np.asarray(self.current_joints, dtype=np.float64)
         exec_plan = self._prepare_execution_plan(plan, current_q)
         if len(exec_plan) == 0:
             self.get_logger().warn("Skipping field test trajectory publish because execution plan is empty.")
-            return
+            return False
+        if self.trajectory_collision_validation_enabled and checker is not None:
+            exec_ok, exec_min_clearance = self._validate_plan_collision(checker, exec_plan)
+            if not exec_ok:
+                self.get_logger().warn(
+                    "Skipping field test trajectory because execution post-processing invalidated its clearance: "
+                    f"min_clearance_m={exec_min_clearance:.4f} "
+                    f"required_margin_m={self.trajectory_collision_margin_m:.4f}."
+                )
+                return False
         msg = JointTrajectory()
         msg.header = Header(frame_id=self.base_frame)
         msg.joint_names = JOINT_NAMES
@@ -1561,6 +2248,7 @@ class FieldPathTest(Node):
             f"Publishing field test trajectory: exec_waypoints={len(msg.points)} estimated_duration_s={t_cur:.1f}"
         )
         self.trajectory_pub.publish(msg)
+        return True
 
 
 def main():

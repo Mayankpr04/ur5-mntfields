@@ -62,14 +62,15 @@ class SparseVoxelMap:
         ]
         for key in self.free:
             has_unknown = False
-            has_occupied = False
             for dx, dy, dz in nbrs:
                 nbr = (key[0] + dx, key[1] + dy, key[2] + dz)
-                if nbr in self.occupied:
-                    has_occupied = True
-                elif nbr not in self.free:
+                if nbr not in self.occupied and nbr not in self.free:
                     has_unknown = True
-            if has_unknown and has_occupied:
+                    break
+            # A frontier is the boundary between known free and unknown
+            # space. Requiring occupied adjacency incorrectly collapses it
+            # onto obstacle surfaces and produces occluded camera goals.
+            if has_unknown:
                 frontier_keys.append(key)
 
         frontier_set = set(frontier_keys)
@@ -98,17 +99,11 @@ class SparseVoxelMap:
                 p_free = self._center(key)
                 for dx, dy, dz in nbrs:
                     nbr = (key[0] + dx, key[1] + dy, key[2] + dz)
-                    if nbr in self.occupied:
-                        p_occ = self._center(nbr)
-                        normal_accum += p_free - p_occ
+                    if nbr not in self.occupied and nbr not in self.free:
+                        normal_accum += self._center(nbr) - p_free
             nrm = float(np.linalg.norm(normal_accum))
             if nrm < 1e-6:
-                cam_to_frontier = centroid
-                nrm = float(np.linalg.norm(cam_to_frontier))
-                if nrm < 1e-6:
-                    normal = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-                else:
-                    normal = cam_to_frontier / nrm
+                normal = np.array([1.0, 0.0, 0.0], dtype=np.float64)
             else:
                 normal = normal_accum / nrm
             clusters.append(FrontierCluster(centroid=centroid.astype(np.float32), voxels=comp, normal=normal.astype(np.float32)))

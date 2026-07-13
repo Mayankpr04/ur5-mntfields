@@ -23,17 +23,18 @@ arm_mntfields_explorer:
     robot_self_filter_padding_m: 0.04
     robot_self_filter_tool_radius_m: 0.08
     robot_self_filter_mount_radius_m: 0.07
-    sample_pairs_per_step: 5000
+    # Active NTFields Algorithm 1: 2000 samples and 5 online updates.
+    sample_pairs_per_step: 2000
     sampling_mode: joint_local_6d
     sampling_proposal_batch_size: 512
     clearance_margin_m: 0.16
     clearance_offset_m: 0.0
     clearance_label_floor: 0.0
     clearance_label_power: 1.0
-    train_epochs_per_step: 30
-    train_every_n_frames: 3
+    train_epochs_per_step: 5
+    train_every_n_frames: 1
     replay_buffer_capacity: 100000
-    train_minibatch_size: 512
+    train_minibatch_size: 2000
     train_replay_ratio: 0.75
     replay_recombine_pairs_per_step: 1500
     adaptive_training_enabled: true
@@ -61,15 +62,19 @@ arm_mntfields_explorer:
     enable_field_diagnostics: true
     field_diagnostics_max_rows: 4096
     field_diagnostics_grid_size: 61
-    field_td_loss_weight: 0.001
-    field_speed_loss_weight: 0.05
-    field_direct_speed_loss_weight: 0.20
-    field_normal_loss_weight: 0.02
-    field_normal_cos_loss_weight: 0.10
-    field_near_obstacle_loss_weight: 4.0
+    field_diagnostics_every_n_train_updates: 5
+    field_diagnostics_save_joint_slices: false
+    # Default to the paper's Eq. 12. Auxiliary losses are opt-in because the
+    # direct speed MSE is unbounded when an initial time gradient is near zero.
+    field_td_loss_weight: 0.0
+    field_speed_loss_weight: 1.0
+    field_direct_speed_loss_weight: 0.0
+    field_normal_loss_weight: 0.0
+    field_normal_cos_loss_weight: 0.0
+    field_near_obstacle_loss_weight: 0.0
     field_low_speed_threshold: 0.20
     field_low_speed_pred_max: 0.30
-    field_low_speed_penalty_weight: 0.05
+    field_low_speed_penalty_weight: 0.0
     field_effective_speed_floor: 0.05
     field_diag_gate_enabled: true
     field_diag_gate_min_replay_pairs: 12000
@@ -90,8 +95,9 @@ arm_mntfields_explorer:
     fast_roi_nbv: true
     roi_nbv_max_pose_candidates: 18
     enable_view_self_occlusion_filter: true
-    min_view_self_occlusion_free_fraction: 0.80
+    min_view_self_occlusion_free_fraction: 0.98
     view_self_occlusion_padding_m: 0.03
+    view_self_occlusion_ignore_near_origin_m: 0.06
     frontier_roi_init_min_points: 300
     frontier_roi_init_min_step: 1
     frontier_roi_padding_xyz: [0.12, 0.12, 0.12]

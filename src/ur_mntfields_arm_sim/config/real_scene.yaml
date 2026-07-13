@@ -52,7 +52,7 @@ arm_mntfields_explorer:
     clearance_label_floor: 0.0
     clearance_label_power: 1.0
     anchor_seed_probability: 0.35
-    train_epochs_per_step: 120
+    train_epochs_per_step: 5
     train_every_n_frames: 1
     replay_buffer_capacity: 100000
     train_minibatch_size: 2048
@@ -60,7 +60,7 @@ arm_mntfields_explorer:
     replay_recombine_pairs_per_step: 2048
     adaptive_training_enabled: true
     field_ready_sample_pairs_per_step: 2048
-    field_ready_train_epochs_per_step: 120
+    field_ready_train_epochs_per_step: 5
     field_ready_train_every_n_frames: 1
     field_ready_replay_recombine_pairs_per_step: 2048
     field_ready_hard_failed_pairs_per_step: 128
@@ -97,8 +97,8 @@ arm_mntfields_explorer:
     enable_field_diagnostics: false
     field_diagnostics_max_rows: 4096
     field_diagnostics_grid_size: 61
-    field_td_loss_weight: 0.001
-    field_speed_loss_weight: 0.01
+    field_td_loss_weight: 0.0
+    field_speed_loss_weight: 1.0
     field_direct_speed_loss_weight: 0.0
     field_normal_loss_weight: 0.001
     field_normal_cos_loss_weight: 0.0
