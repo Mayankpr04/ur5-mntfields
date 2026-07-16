@@ -19,7 +19,7 @@ class NN(torch.nn.Module):
     accidentally use gradients of tau as gradients of arrival time.
     """
 
-    ARCHITECTURE_VERSION = "pinn_factorized_t_v2"
+    ARCHITECTURE_VERSION = "pinn_factorized_t_state_geometry_v3"
 
     def __init__(self, device: str, dim: int, B: Tensor):
         super().__init__()
@@ -40,6 +40,14 @@ class NN(torch.nn.Module):
             Linear(self.hidden_dim, self.hidden_dim) for _ in range(3)
         )
         self.output = Linear(self.hidden_dim, 1)
+        # Geometry is a property of one configuration, not of an arbitrary
+        # goal paired with it.  Keeping this head on the shared encoder makes
+        # direct-edge safety invariant to the direction in which it is
+        # queried while retaining the symmetric travel-time generator.
+        self.geometry = torch.nn.ModuleList(
+            Linear(self.hidden_dim, self.hidden_dim) for _ in range(2)
+        )
+        self.geometry_output = Linear(self.hidden_dim, 2)
         self.softplus = torch.nn.Softplus(beta=10.0)
 
     @staticmethod
@@ -83,6 +91,16 @@ class NN(torch.nn.Module):
             x = self.softplus(layer(x))
         tau = torch.sigmoid(self.output(x))
         return tau, self.output.weight, coords
+
+    def state_geometry(self, q: Tensor) -> tuple[Tensor, Tensor]:
+        """Return normalized speed and unsafe logit for ``[N, dim]`` states."""
+        if q.ndim != 2 or q.shape[1] != self.dim:
+            raise ValueError(f"Expected state coordinates [N,{self.dim}], got {tuple(q.shape)}")
+        x = self._encode(q)
+        for layer in self.geometry:
+            x = self.softplus(layer(x))
+        raw = self.geometry_output(x)
+        return torch.sigmoid(raw[:, 0]), raw[:, 1]
 
     def forward(self, coords: Tensor) -> tuple[Tensor, Tensor]:
         output, _w, mapped_coords = self.out(coords)

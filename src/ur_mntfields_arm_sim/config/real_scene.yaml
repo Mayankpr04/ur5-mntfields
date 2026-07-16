@@ -30,6 +30,7 @@ arm_mntfields_explorer:
     scene_boxes: [""]
 
     voxel_size_m: 0.05
+    mapping_joint_sync_tolerance_s: 0.10
     raycast_stride_px: 8
     depth_min_m: 0.20
     depth_max_m: 2.00
@@ -64,6 +65,11 @@ arm_mntfields_explorer:
     field_ready_train_every_n_frames: 1
     field_ready_replay_recombine_pairs_per_step: 2048
     field_ready_hard_failed_pairs_per_step: 128
+    # Collect a coverage-qualified static map before any optimizer work. This
+    # keeps depth ingestion responsive and prevents unknown visibility from
+    # contaminating geometry training.
+    online_map_freeze_s: 90.0
+    online_map_freeze_min_coverage: 0.90
     path_centered_pair_fraction: 0.10
     near_boundary_pair_fraction: 0.35
     path_anchor_stride: 4
@@ -107,12 +113,11 @@ arm_mntfields_explorer:
     field_low_speed_pred_max: 0.30
     field_low_speed_penalty_weight: 0.0
     field_effective_speed_floor: 0.04
-    field_diag_gate_enabled: true
-    field_diag_gate_min_replay_pairs: 12000
-    field_diag_max_low_overpred_frac: 0.45
-    field_diag_min_speed_corr: 0.35
-    field_diag_min_near_far_gap: 0.20
-    field_diag_min_normal_cos_near: 0.20
+    state_readiness_gate_enabled: true
+    state_readiness_min_replay_states: 12000
+    state_readiness_min_free_states: 256
+    state_readiness_min_free_recall: 0.60
+    state_readiness_max_false_free_rate: 0.02
 
     debug_point_cloud_topic: /debug/points/world
     planned_path_topic: /ur_mntfields_arm/planned_path

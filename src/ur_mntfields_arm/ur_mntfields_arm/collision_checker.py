@@ -19,6 +19,7 @@ class UR5PointCloudCollisionChecker:
         sphere_assets_root: str = "/home/mayank/ur_ws/ntrl-demo/datasets/arm/UR5/meshes/sphere/sphere",
         support_box_count: int = 0,
         support_point_ignore_padding_m: float = 0.15,
+        attached_spheres_local: np.ndarray | None = None,
     ):
         self.kinematics = kinematics
         raw_occupied_points = np.asarray(occupied_points, dtype=np.float64).reshape(-1, 3)
@@ -51,6 +52,19 @@ class UR5PointCloudCollisionChecker:
         #print("Using device :" , self.device)
         self.sphere_assets_root = Path(sphere_assets_root)
         self.link_spheres_local = self._load_link_spheres()
+        attached = np.asarray(
+            np.zeros((0, 4), dtype=np.float64)
+            if attached_spheres_local is None
+            else attached_spheres_local,
+            dtype=np.float64,
+        ).reshape(-1, 4)
+        if len(attached):
+            valid_attached = np.all(np.isfinite(attached), axis=1) & (attached[:, 3] > 0.0)
+            if not np.all(valid_attached):
+                raise ValueError("attached_spheres_local must contain finite xyz and positive radii")
+            # The final link frame is tool0, so attached geometry shares the
+            # wrist_3 transform and contributes to the correct joint gradient.
+            self.link_spheres_local[-1] = np.vstack((self.link_spheres_local[-1], attached))
         self._init_torch_buffers()
         voxel_size = 0.05
         if len(self.occupied_points):
@@ -357,6 +371,19 @@ class UR5PointCloudCollisionChecker:
     def robot_spheres(self, q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         return self._sphere_samples(q)
 
+    def robot_spheres_batch(self, q_batch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        q = np.asarray(q_batch, dtype=np.float32).reshape(-1, 6)
+        if len(q) == 0:
+            return np.zeros((0, 0, 3), dtype=np.float32), np.zeros((0, 0), dtype=np.float32)
+        with torch.no_grad():
+            centers, radii, _link_ids, _frames = self._sphere_samples_batch_torch(
+                torch.as_tensor(q, dtype=torch.float32, device=self.device)
+            )
+        return (
+            centers.detach().cpu().numpy().astype(np.float32),
+            radii.detach().cpu().numpy().astype(np.float32),
+        )
+
     def filter_robot_self_points(
         self,
         points: np.ndarray,
@@ -508,6 +535,7 @@ class UR5SDFCollisionChecker(UR5PointCloudCollisionChecker):
         sdf_max_cells: int = 4_000_000,
         support_box_count: int = 0,
         support_point_ignore_padding_m: float = 0.15,
+        attached_spheres_local: np.ndarray | None = None,
     ):
         super().__init__(
             kinematics=kinematics,
@@ -516,6 +544,7 @@ class UR5SDFCollisionChecker(UR5PointCloudCollisionChecker):
             support_box_count=support_box_count,
             support_point_ignore_padding_m=support_point_ignore_padding_m,
             sphere_assets_root=sphere_assets_root,
+            attached_spheres_local=attached_spheres_local,
         )
         self.sdf_voxel_size_m = float(max(1.0e-3, sdf_voxel_size_m))
         self.sdf_padding_m = float(max(0.0, sdf_padding_m))
@@ -524,6 +553,8 @@ class UR5SDFCollisionChecker(UR5PointCloudCollisionChecker):
         self.sdf_upper: np.ndarray | None = None
         self.sdf_grid: np.ndarray | None = None
         self.sdf_grad_grid: np.ndarray | None = None
+        self.sdf_grid_t: torch.Tensor | None = None
+        self.sdf_grad_grid_t: torch.Tensor | None = None
         self.sdf_effective_voxel_size_m = self.sdf_voxel_size_m
         self._build_point_sdf()
 
@@ -565,7 +596,79 @@ class UR5SDFCollisionChecker(UR5PointCloudCollisionChecker):
         self.sdf_upper = (lo + (dims.astype(np.float64) - 1.0) * voxel).astype(np.float64)
         self.sdf_grid = dist
         self.sdf_grad_grid = grad
+        # High-volume online labels already compute robot FK on this device.
+        # Keep the lookup tables beside it so every batch does not bounce all
+        # sphere centers GPU -> NumPy -> GPU.
+        self.sdf_grid_t = torch.as_tensor(dist, dtype=torch.float32, device=self.device)
+        self.sdf_grad_grid_t = torch.as_tensor(grad, dtype=torch.float32, device=self.device)
         self.sdf_effective_voxel_size_m = float(voxel)
+
+    def _lookup_trilinear_torch(
+        self, grid: torch.Tensor, points: torch.Tensor
+    ) -> torch.Tensor:
+        if self.sdf_origin is None:
+            raise RuntimeError("SDF origin is not initialized")
+        origin = torch.as_tensor(
+            self.sdf_origin, dtype=points.dtype, device=points.device
+        )
+        dims = torch.as_tensor(
+            grid.shape[:3], dtype=torch.long, device=points.device
+        )
+        coords = (points - origin[None, :]) / self.sdf_effective_voxel_size_m
+        base_unclamped = torch.floor(coords).to(torch.long)
+        frac = torch.clamp(coords - base_unclamped.to(coords.dtype), 0.0, 1.0)
+        base = torch.minimum(
+            torch.maximum(base_unclamped, torch.zeros_like(base_unclamped)),
+            dims[None, :] - 2,
+        )
+        i0, j0, k0 = base.unbind(dim=1)
+        i1, j1, k1 = i0 + 1, j0 + 1, k0 + 1
+        fx, fy, fz = frac.unbind(dim=1)
+        vector_grid = grid.ndim == 4
+        if vector_grid:
+            fx, fy, fz = fx[:, None], fy[:, None], fz[:, None]
+        c000, c100 = grid[i0, j0, k0], grid[i1, j0, k0]
+        c010, c110 = grid[i0, j1, k0], grid[i1, j1, k0]
+        c001, c101 = grid[i0, j0, k1], grid[i1, j0, k1]
+        c011, c111 = grid[i0, j1, k1], grid[i1, j1, k1]
+        c00 = c000 * (1.0 - fx) + c100 * fx
+        c10 = c010 * (1.0 - fx) + c110 * fx
+        c01 = c001 * (1.0 - fx) + c101 * fx
+        c11 = c011 * (1.0 - fx) + c111 * fx
+        c0 = c00 * (1.0 - fy) + c10 * fy
+        c1 = c01 * (1.0 - fy) + c11 * fy
+        return c0 * (1.0 - fz) + c1 * fz
+
+    def _point_sdf_lookup_torch(
+        self, points: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if (
+            self.sdf_grid_t is None
+            or self.sdf_grad_grid_t is None
+            or self.sdf_origin is None
+            or self.sdf_upper is None
+        ):
+            return (
+                torch.full((len(points),), float("inf"), dtype=points.dtype, device=points.device),
+                torch.zeros((len(points), 3), dtype=points.dtype, device=points.device),
+            )
+        distance = self._lookup_trilinear_torch(self.sdf_grid_t, points)
+        gradient = self._lookup_trilinear_torch(self.sdf_grad_grid_t, points)
+        lower = torch.as_tensor(self.sdf_origin, dtype=points.dtype, device=points.device)
+        upper = torch.as_tensor(self.sdf_upper, dtype=points.dtype, device=points.device)
+        below = torch.clamp(lower[None, :] - points, min=0.0)
+        above = torch.clamp(points - upper[None, :], min=0.0)
+        outside = above - below
+        outside_norm = torch.linalg.vector_norm(outside, dim=1)
+        outside_mask = outside_norm > 1.0e-8
+        distance = distance + outside_norm
+        outside_normal = outside / outside_norm[:, None].clamp_min(1.0e-8)
+        gradient = torch.where(outside_mask[:, None], outside_normal, gradient)
+        norm = torch.linalg.vector_norm(gradient, dim=1, keepdim=True)
+        gradient = torch.where(
+            norm > 1.0e-8, gradient / norm.clamp_min(1.0e-8), torch.zeros_like(gradient)
+        )
+        return distance, gradient
 
     def _lookup_trilinear(self, grid: np.ndarray, points: np.ndarray) -> np.ndarray:
         origin = self.sdf_origin
@@ -640,9 +743,7 @@ class UR5SDFCollisionChecker(UR5PointCloudCollisionChecker):
             flat_centers = centers.reshape(-1, 3)
             flat_count = int(flat_centers.shape[0])
 
-            point_d_np, point_n_np = self._point_sdf_lookup(flat_centers.detach().cpu().numpy())
-            point_dists = torch.as_tensor(point_d_np, dtype=torch.float32, device=self.device)
-            point_normals = torch.as_tensor(point_n_np, dtype=torch.float32, device=self.device)
+            point_dists, point_normals = self._point_sdf_lookup_torch(flat_centers)
 
             box_dists = torch.full((flat_count,), float("inf"), dtype=torch.float32, device=self.device)
             box_normals = torch.zeros((flat_count, 3), dtype=torch.float32, device=self.device)
@@ -724,6 +825,7 @@ def make_ur5_collision_checker(
     sdf_max_cells: int = 4_000_000,
     support_box_count: int = 0,
     support_point_ignore_padding_m: float = 0.15,
+    attached_spheres_local: np.ndarray | None = None,
 ) -> UR5PointCloudCollisionChecker:
     backend = str(clearance_backend or "original").strip().lower()
     if backend in {"sdf", "edt", "sdf_edt"}:
@@ -733,6 +835,7 @@ def make_ur5_collision_checker(
             box_obstacles=box_obstacles,
             support_box_count=support_box_count,
             support_point_ignore_padding_m=support_point_ignore_padding_m,
+            attached_spheres_local=attached_spheres_local,
             sdf_voxel_size_m=sdf_voxel_size_m,
             sdf_padding_m=sdf_padding_m,
             sdf_max_cells=sdf_max_cells,
@@ -745,4 +848,20 @@ def make_ur5_collision_checker(
         box_obstacles=box_obstacles,
         support_box_count=support_box_count,
         support_point_ignore_padding_m=support_point_ignore_padding_m,
+        attached_spheres_local=attached_spheres_local,
     )
+
+
+def wrist_camera_collision_spheres(camera_in_tool: np.ndarray) -> np.ndarray:
+    """Conservatively represent the wrist camera body and its small bracket."""
+
+    transform = np.asarray(camera_in_tool, dtype=np.float64).reshape(4, 4)
+    center = transform[:3, 3]
+    # Exact circumsphere radius of the URDF camera collision box.
+    radius = float(np.linalg.norm(np.asarray([0.02, 0.02, 0.01], dtype=np.float64)))
+    bracket_centers = np.asarray(
+        [0.35 * center, 0.70 * center],
+        dtype=np.float64,
+    )
+    bracket = np.column_stack((bracket_centers, np.full((2,), 0.015, dtype=np.float64)))
+    return np.vstack((bracket, np.asarray([[center[0], center[1], center[2], radius]])))

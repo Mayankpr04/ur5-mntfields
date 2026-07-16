@@ -21,10 +21,16 @@ def generate_launch_description():
     sim_launch_rviz = LaunchConfiguration("sim_launch_rviz")
     checkpoint_path = LaunchConfiguration("checkpoint_path")
     planner_mode = LaunchConfiguration("planner_mode")
+    allow_uncertified_anchor_checkpoint = LaunchConfiguration(
+        "allow_uncertified_anchor_checkpoint"
+    )
     planner_type = LaunchConfiguration("planner_type")
     clearance_backend = LaunchConfiguration("clearance_backend")
     planner_direct_edge = LaunchConfiguration("planner_direct_edge")
     planner_shortcut = LaunchConfiguration("planner_shortcut")
+    budgeted_anchor_count = LaunchConfiguration("budgeted_anchor_count")
+    budgeted_anchor_sample_path = LaunchConfiguration("budgeted_anchor_sample_path")
+    budgeted_anchor_force_first_goal = LaunchConfiguration("budgeted_anchor_force_first_goal")
     path_shortcut_max_passes = LaunchConfiguration("path_shortcut_max_passes")
     rrt_step_size_q = LaunchConfiguration("rrt_step_size_q")
     rrt_max_iters = LaunchConfiguration("rrt_max_iters")
@@ -33,8 +39,10 @@ def generate_launch_description():
     collision_cloud_path = LaunchConfiguration("collision_cloud_path")
     collision_aware_field_rollout = LaunchConfiguration("collision_aware_field_rollout")
     trajectory_collision_validation_enabled = LaunchConfiguration("trajectory_collision_validation_enabled")
+    field_precheck_enabled = LaunchConfiguration("field_precheck_enabled")
     learned_speed_search_min_speed = LaunchConfiguration("learned_speed_search_min_speed")
     field_path_joint_edge_weight = LaunchConfiguration("field_path_joint_edge_weight")
+    field_path_turn_weight = LaunchConfiguration("field_path_turn_weight")
     field_path_tool_edge_weight = LaunchConfiguration("field_path_tool_edge_weight")
     field_path_tool_goal_weight = LaunchConfiguration("field_path_tool_goal_weight")
     field_path_clearance_penalty_weight = LaunchConfiguration("field_path_clearance_penalty_weight")
@@ -75,6 +83,7 @@ def generate_launch_description():
     fixed_goal_mode = LaunchConfiguration("fixed_goal_mode")
     fixed_goal_return_to_first = LaunchConfiguration("fixed_goal_return_to_first")
     fixed_goal_anchor_routing_enabled = LaunchConfiguration("fixed_goal_anchor_routing_enabled")
+    fixed_goal_joint_positions_csv = LaunchConfiguration("fixed_goal_joint_positions_csv")
     fixed_goal_point_x = LaunchConfiguration("fixed_goal_point_x")
     fixed_goal_point_y = LaunchConfiguration("fixed_goal_point_y")
     fixed_goal_point_z = LaunchConfiguration("fixed_goal_point_z")
@@ -195,9 +204,13 @@ def generate_launch_description():
                 "checkpoint_path": checkpoint_path,
                 "planner_mode": planner_mode,
                 "planner_type": planner_type,
+                "allow_uncertified_anchor_checkpoint": allow_uncertified_anchor_checkpoint,
                 "clearance_backend": clearance_backend,
                 "planner_direct_edge": planner_direct_edge,
                 "planner_shortcut": planner_shortcut,
+                "budgeted_anchor_count": budgeted_anchor_count,
+                "budgeted_anchor_sample_path": budgeted_anchor_sample_path,
+                "budgeted_anchor_force_first_goal": budgeted_anchor_force_first_goal,
                 "path_shortcut_max_passes": path_shortcut_max_passes,
                 "rrt_step_size_q": rrt_step_size_q,
                 "rrt_max_iters": rrt_max_iters,
@@ -208,6 +221,7 @@ def generate_launch_description():
                 "trajectory_collision_validation_enabled": trajectory_collision_validation_enabled,
                 "learned_speed_search_min_speed": learned_speed_search_min_speed,
                 "field_path_joint_edge_weight": field_path_joint_edge_weight,
+                "field_path_turn_weight": field_path_turn_weight,
                 "field_path_tool_edge_weight": field_path_tool_edge_weight,
                 "field_path_tool_goal_weight": field_path_tool_goal_weight,
                 "field_path_clearance_penalty_weight": field_path_clearance_penalty_weight,
@@ -255,6 +269,7 @@ def generate_launch_description():
                 "fixed_goal_mode": fixed_goal_mode,
                 "fixed_goal_return_to_first": fixed_goal_return_to_first,
                 "fixed_goal_anchor_routing_enabled": fixed_goal_anchor_routing_enabled,
+                "fixed_goal_joint_positions_csv": fixed_goal_joint_positions_csv,
                 # Camera-facing transition pose at world xyz ~= [0.346, 0.350, 0.800],
                 # centered on the cabinet and 0.35 m in front of its opening.
                 "fixed_goal_anchor_joint_position": [-0.0834, -2.0102, 2.7639, -3.8953, -1.4873, 0.0],
@@ -275,13 +290,14 @@ def generate_launch_description():
                 "goal_candidate_sweep_save_path": goal_candidate_sweep_save_path,
                 "goal_candidate_execute_indices_csv": goal_candidate_execute_indices_csv,
                 "goal_candidate_execute_return_startup": goal_candidate_execute_return_startup,
-                "field_precheck_enabled": True,
+                "field_precheck_enabled": field_precheck_enabled,
                 "field_precheck_min_speed": 0.02,
                 "field_precheck_neighborhood_samples": 8,
                 "field_precheck_neighborhood_radius_norm": 0.015,
                 "field_local_rollout_candidates": 32,
                 "direct_joint_fallback_enabled": False,
                 "trajectory_max_joint_speed": 0.10,
+                "trajectory_max_joint_acceleration": 0.25,
                 "trajectory_min_segment_dt": 0.65,
                 "trajectory_waypoint_stride": 1,
                 "trajectory_smoothing_window": 1,
@@ -309,9 +325,14 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument("planner_mode", default_value="bidirectional"),
             DeclareLaunchArgument(
+                "allow_uncertified_anchor_checkpoint",
+                default_value="false",
+                description="Diagnostic-only override allowing field_anchor to load weights_partial.pt.",
+            ),
+            DeclareLaunchArgument(
                 "planner_type",
                 default_value="field_search",
-                description="Planner implementation: learned_speed_search, field, field_search, or rrt_connect.",
+                description="Planner implementation: field_anchor, field, field_search, learned_speed_search, or rrt_connect.",
             ),
             DeclareLaunchArgument(
                 "planner_direct_edge",
@@ -322,6 +343,21 @@ def generate_launch_description():
                 "planner_shortcut",
                 default_value="true",
                 description="Allow post-search shortcutting inside the field planner.",
+            ),
+            DeclareLaunchArgument(
+                "budgeted_anchor_count",
+                default_value="1",
+                description="Hard anchor budget for field_anchor; valid values are one or two.",
+            ),
+            DeclareLaunchArgument(
+                "budgeted_anchor_sample_path",
+                default_value="",
+                description="Optional training step NPZ used to derive environment-specific free configuration probes.",
+            ),
+            DeclareLaunchArgument(
+                "budgeted_anchor_force_first_goal",
+                default_value="false",
+                description="Route the first fixed goal through the selected opening anchor.",
             ),
             DeclareLaunchArgument(
                 "path_shortcut_max_passes",
@@ -356,6 +392,11 @@ def generate_launch_description():
                 description="Validate planned trajectory collision before execution. Set false only for field-only timing tests.",
             ),
             DeclareLaunchArgument(
+                "field_precheck_enabled",
+                default_value="true",
+                description="Reject endpoints with a failed learned state/coverage oracle before planning.",
+            ),
+            DeclareLaunchArgument(
                 "learned_speed_search_min_speed",
                 default_value="0.20",
                 description="Minimum neural predicted speed accepted by network-only field_search edges.",
@@ -367,8 +408,13 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "field_path_joint_edge_weight",
-                default_value="0.0",
+                default_value="0.15",
                 description="Accumulated joint-edge path cost weight for deterministic field_search.",
+            ),
+            DeclareLaunchArgument(
+                "field_path_turn_weight",
+                default_value="0.25",
+                description="Penalty for sharp changes in joint-space search direction.",
             ),
             DeclareLaunchArgument(
                 "field_path_tool_edge_weight",
@@ -382,7 +428,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "field_path_clearance_penalty_weight",
-                default_value="0.0",
+                default_value="20.0",
                 description="Accumulated soft clearance penalty weight for deterministic field_search.",
             ),
             DeclareLaunchArgument(
@@ -513,6 +559,11 @@ def generate_launch_description():
                 "fixed_goal_anchor_routing_enabled",
                 default_value="false",
                 description="Route inter-shelf fixed-goal legs through a centered free-space cabinet anchor.",
+            ),
+            DeclareLaunchArgument(
+                "fixed_goal_joint_positions_csv",
+                default_value="",
+                description="Optional comma-separated joint goals; six values per goal.",
             ),
             DeclareLaunchArgument("fixed_goal_point_x", default_value="0.60"),
             DeclareLaunchArgument("fixed_goal_point_y", default_value="0.35"),

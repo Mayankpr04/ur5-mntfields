@@ -93,17 +93,12 @@ class ViewGoalSelector:
         self.frontier_pose_cache: dict[int, dict[str, object]] = {}
 
     def _tool_camera_extra_spheres(self, q_goal: np.ndarray) -> np.ndarray:
-        tool_pose = self.kinematics.fk(q_goal)
-        cam_pose = self.kinematics.tool_to_camera_pose(tool_pose, self.camera_in_tool)
-        tool_xyz = np.asarray(tool_pose[:3, 3], dtype=np.float64)
-        cam_xyz = np.asarray(cam_pose[:3, 3], dtype=np.float64)
-        mount_xyz = 0.5 * (tool_xyz + cam_xyz)
-        spheres = []
-        if self.self_occlusion_tool_radius_m > 0.0:
-            spheres.append(np.r_[tool_xyz, self.self_occlusion_tool_radius_m])
-        if self.self_occlusion_mount_radius_m > 0.0 and np.linalg.norm(cam_xyz - tool_xyz) > 1.0e-4:
-            spheres.append(np.r_[mount_xyz, self.self_occlusion_mount_radius_m])
-        return np.asarray(spheres, dtype=np.float64).reshape(-1, 4)
+        del q_goal
+        # The checker now contains wrist, bracket, and camera geometry. The
+        # former 80 mm tool/70 mm mount proxies were useful while the camera
+        # was absent, but with a top-mounted camera they intersect its forward
+        # rays and falsely reject otherwise visible NBV poses.
+        return np.zeros((0, 4), dtype=np.float64)
 
     def _self_occlusion_free_fraction(
         self,

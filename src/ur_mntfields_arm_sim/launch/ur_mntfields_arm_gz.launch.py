@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, Shutdown, TimerAction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, LaunchConfiguration, PathJoinSubstitution
@@ -18,6 +18,7 @@ def generate_launch_description():
     controllers_cfg = PathJoinSubstitution([pkg_share, "config", "gz_controllers.yaml"])
     sim_launch_rviz = LaunchConfiguration("sim_launch_rviz")
     clearance_backend = LaunchConfiguration("clearance_backend")
+    output_dir = LaunchConfiguration("output_dir")
 
     robot_description = Command(
         [
@@ -104,7 +105,13 @@ def generate_launch_description():
         executable="arm_mntfields_explorer",
         name="arm_mntfields_explorer",
         output="screen",
-        parameters=[scene_cfg, startup_cfg, {"use_sim_time": True, "clearance_backend": clearance_backend}],
+        parameters=[scene_cfg, startup_cfg, {
+            "use_sim_time": True,
+            "clearance_backend": clearance_backend,
+            "output_dir": output_dir,
+            "require_fresh_output_dir": True,
+        }],
+        on_exit=Shutdown(reason="online field training process exited"),
     )
 
     executor = Node(
@@ -135,6 +142,11 @@ def generate_launch_description():
     return LaunchDescription(
         [
             DeclareLaunchArgument("sim_launch_rviz", default_value="true"),
+            DeclareLaunchArgument(
+                "output_dir",
+                default_value="/tmp/ur_mntfields_online_v3",
+                description="Must be a new empty directory; online training never resumes or reuses weights.",
+            ),
             DeclareLaunchArgument(
                 "clearance_backend",
                 default_value="original",

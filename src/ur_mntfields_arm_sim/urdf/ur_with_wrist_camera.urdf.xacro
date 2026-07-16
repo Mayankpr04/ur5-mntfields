@@ -106,7 +106,8 @@
   <joint name="tool0_to_camera_link" type="fixed">
     <parent link="tool0"/>
     <child link="camera_link"/>
-    <origin xyz="0.0 0.0 0.10" rpy="1.57079632679 -1.57079632679 0"/>
+    <!-- tool -Y is above the wrist; tool +Z remains the viewing direction. -->
+    <origin xyz="0.0 -0.08 0.02" rpy="1.57079632679 -1.57079632679 0"/>
   </joint>
 
   <link name="camera_color_frame"/>

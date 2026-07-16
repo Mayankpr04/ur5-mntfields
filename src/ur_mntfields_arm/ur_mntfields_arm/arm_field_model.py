@@ -21,22 +21,27 @@ class ArmFieldModel:
         self,
         model_dir: str,
         device: str = "cuda:0",
-        replay_capacity: int = 50000,
+        replay_capacity: int = 300000,
         minibatch_size: int = 512,
         replay_ratio: float = 0.75,
         priority_ratio: float = 0.0,
         gradient_accumulation_steps: int = 1,
-        td_loss_weight: float = 1.0e-3,
+        td_loss_weight: float = 1.0e-2,
         speed_loss_weight: float = 1.0e-2,
         log_speed_loss_weight: float = 0.0,
         direct_speed_loss_weight: float = 0.0,
-        normal_loss_weight: float = 1.0e-3,
+        normal_loss_weight: float = 0.0,
         normal_cos_loss_weight: float = 0.0,
         near_obstacle_loss_weight: float = 0.0,
         low_speed_threshold: float = 0.20,
         low_speed_pred_max: float = 0.35,
         low_speed_penalty_weight: float = 0.0,
         effective_speed_floor: float = 0.05,
+        state_clearance_loss_weight: float = 1.0,
+        unsafe_loss_weight: float = 0.5,
+        shell_normal_loss_weight: float = 0.1,
+        false_free_loss_weight: float = 2.0,
+        consistency_loss_weight: float = 0.01,
     ):
         self.model_dir = Path(model_dir)
         self.model_dir.mkdir(parents=True, exist_ok=True)
@@ -53,6 +58,11 @@ class ArmFieldModel:
             "low_speed_pred_max": float(low_speed_pred_max),
             "low_speed_penalty_weight": float(low_speed_penalty_weight),
             "effective_speed_floor": float(effective_speed_floor),
+            "state_clearance_loss_weight": float(state_clearance_loss_weight),
+            "unsafe_loss_weight": float(unsafe_loss_weight),
+            "shell_normal_loss_weight": float(shell_normal_loss_weight),
+            "false_free_loss_weight": float(false_free_loss_weight),
+            "consistency_loss_weight": float(consistency_loss_weight),
         }
         self.model = Model(
             folder=str(self.model_dir),
@@ -79,6 +89,17 @@ class ArmFieldModel:
         self.last_train_batch_size = 0
         self.last_train_pair_count = 0
         self.last_diagnostics: dict[str, float] = {}
+        self.checkpoint_metadata: dict[str, object] = {}
+        self.calibration_margins: dict[str, float] = {}
+        self.coverage_states = np.zeros((0, 6), dtype=np.float32)
+        self.coverage_landmarks = np.zeros((0, 6), dtype=np.float32)
+        self.coverage_tree = None
+        self.shell_coverage_radius = 0.0
+        self.free_coverage_radius = 0.0
+        self.certification_passed = False
+        self.legacy_checkpoint = False
+        from ur_mntfields_arm.online_training import StateReplay
+        self.state_replay = StateReplay(capacity=self.replay_capacity)
 
     def _ensure_replay_buffer(self, row_width: int):
         if self.replay_buffer is None:
@@ -101,6 +122,16 @@ class ArmFieldModel:
     def add_rows(self, frame_data: np.ndarray):
         rows = np.asarray(frame_data, dtype=np.float32)
         if rows.ndim != 2 or len(rows) == 0:
+            return
+        if rows.shape[1] == 17:
+            version = int(np.max(np.rint(rows[:, 16])))
+            self.state_replay.set_map_version(version)
+            self.state_replay.add(rows)
+            valid = self.state_replay.valid_rows()
+            self.replay_buffer = np.zeros((self.replay_capacity, 17), dtype=np.float32)
+            self.replay_buffer[: len(valid)] = valid
+            self.replay_size = len(valid)
+            self.replay_insert_idx = self.replay_size % self.replay_capacity
             return
         self._ensure_replay_buffer(int(rows.shape[1]))
         assert self.replay_buffer is not None
@@ -139,6 +170,11 @@ class ArmFieldModel:
     ) -> np.ndarray:
         frame_rows = np.asarray(frame_data, dtype=np.float32)
         batch_size = self.effective_minibatch_size
+        if frame_rows.ndim == 2 and frame_rows.shape[1] == 17:
+            # Replay admission enforces source quotas; optimizer sampling also
+            # enforces a useful free/unsafe label mixture so the unsafe head
+            # cannot minimize its loss by rejecting nearly everything.
+            return self.state_replay.sample_learning_balanced(batch_size)
         priority = (
             np.asarray(priority_rows, dtype=np.float32)
             if priority_rows is not None
@@ -296,6 +332,13 @@ class ArmFieldModel:
         # the long-lived replay buffer so they cannot recursively dominate it.
         if len(persistent_rows):
             self.add_rows(persistent_rows)
+        if (
+            priority_rows is not None
+            and np.asarray(priority_rows).ndim == 2
+            and np.asarray(priority_rows).shape[1] == 17
+            and len(priority_rows)
+        ):
+            self.add_rows(np.asarray(priority_rows, dtype=np.float32))
         training_rows = (
             np.concatenate((persistent_rows, transient), axis=0).astype(np.float32, copy=False)
             if len(transient)
@@ -303,11 +346,68 @@ class ArmFieldModel:
         )
         train_steps = max(1, int(epochs))
         last_loss = None
-        for _ in range(train_steps):
+        state_rows = self.state_replay.valid_rows()
+        state_replay_t: torch.Tensor | None = None
+        state_indices_t: torch.Tensor | None = None
+        if (
+            persistent_rows.shape[1] == 17
+            and len(state_rows) >= 2
+        ):
+            # Upload the current replay once per optimizer cycle. Previously
+            # every one of ~180 updates copied a NumPy minibatch to CUDA,
+            # forcing the GPU to wait on repeated host/device transfers.
+            state_replay_t = torch.from_numpy(
+                np.ascontiguousarray(state_rows)
+            ).to(self.device, dtype=torch.float32, non_blocking=True)
+            index_batches = [
+                self.state_replay.sample_learning_balanced_indices(
+                    self.effective_minibatch_size, rows=state_rows
+                )
+                for _ in range(train_steps)
+            ]
+            even = min(((len(index) // 2) * 2 for index in index_batches), default=0)
+            if even >= 2:
+                indices_np = np.stack(
+                    [index[:even] for index in index_batches], axis=0
+                ).astype(np.int64, copy=False)
+                state_indices_t = torch.from_numpy(indices_np).to(
+                    self.device, non_blocking=True
+                )
+        for train_index in range(train_steps):
+            if state_replay_t is not None and state_indices_t is not None:
+                index_t = state_indices_t[train_index]
+                even = int(len(index_t))
+                state_batch_t = state_replay_t.index_select(0, index_t)
+                order_t = torch.randperm(even, device=self.device)
+                state_batch_t = state_batch_t.index_select(0, order_t)
+                pair_points_t = torch.cat(
+                    (state_batch_t[0::2, :6], state_batch_t[1::2, :6]), dim=1
+                )
+                self.last_train_batch_size = int(even)
+                self.last_train_pair_count = int(len(pair_points_t))
+                last_loss = self.model.train_state_batch(state_batch_t, pair_points_t)
+                continue
             state_batch = self.sample_training_batch(training_rows, priority_rows=priority_rows)
             if state_batch.size == 0:
                 continue
             self.last_train_batch_size = int(len(state_batch))
+            if state_batch.ndim == 2 and state_batch.shape[1] == 17:
+                even = (len(state_batch) // 2) * 2
+                state_batch = state_batch[:even]
+                if even < 2:
+                    continue
+                order = np.random.permutation(even)
+                state_batch = state_batch[order]
+                pair_points = np.concatenate(
+                    (state_batch[0::2, :6], state_batch[1::2, :6]), axis=1
+                ).astype(np.float32)
+                last_loss = self.model.train_state_batch(
+                    torch.from_numpy(state_batch).float().to(self.device),
+                    torch.from_numpy(pair_points).float().to(self.device),
+                )
+                self.last_train_pair_count = int(len(pair_points))
+                if last_loss is not None:
+                    continue
             pair_batch = self.build_pair_batch(state_batch)
             pair_batch = self.reshuffle_pair_endpoints(pair_batch)
             self.last_train_pair_count = int(len(pair_batch))
@@ -366,6 +466,94 @@ class ArmFieldModel:
             pred1_parts.append(pred1.detach().cpu().numpy().astype(np.float32))
         self.model.network.train(was_training)
         return np.concatenate(pred0_parts), np.concatenate(pred1_parts)
+
+    def predict_normalized_state_geometry(
+        self, q_batch: np.ndarray, batch_size: int = 4096
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Predict goal-independent speed, unsafe probability and calibrated speed."""
+        q = np.asarray(q_batch, dtype=np.float32)
+        if q.ndim == 1:
+            q = q[None, :]
+        if q.ndim != 2 or q.shape[1] != self.dim or len(q) == 0:
+            z = np.zeros((0,), dtype=np.float32)
+            return z, z, z
+        speeds: list[np.ndarray] = []
+        unsafe: list[np.ndarray] = []
+        was_training = bool(self.model.network.training)
+        self.model.network.train(False)
+        with torch.inference_mode():
+            for start in range(0, len(q), max(1, int(batch_size))):
+                qt = torch.from_numpy(
+                    np.ascontiguousarray(np.clip(q[start:start + batch_size], -0.5, 0.5))
+                ).to(self.device, non_blocking=True)
+                speed_t, unsafe_logit = self.model.network.state_geometry(qt)
+                speeds.append(speed_t.cpu().numpy().astype(np.float32))
+                unsafe.append(torch.sigmoid(unsafe_logit).cpu().numpy().astype(np.float32))
+        self.model.network.train(was_training)
+        speed = np.concatenate(speeds)
+        unsafe_probability = np.concatenate(unsafe)
+        # Calibration is intentionally subtractive and never increases a
+        # network prediction.  Per-bin margins are selected on held-out data.
+        margins = np.full(len(speed), float(self.calibration_margins.get("global", 0.0)), dtype=np.float32)
+        if self.coverage_tree is not None and any(key.startswith("clearance_") for key in self.calibration_margins):
+            distance, _ = self.coverage_tree.query(np.clip(q, -0.5, 0.5), k=1)
+            predicted_clearance = 0.10 * speed
+            clearance_bin = np.select(
+                [predicted_clearance < 0.01, predicted_clearance < 0.03, predicted_clearance < 0.07],
+                [0, 1, 2], default=3,
+            )
+            coverage_bin = np.select([distance < 0.02, distance < 0.05], [0, 1], default=2)
+            for ci in range(4):
+                for di in range(3):
+                    mask = (clearance_bin == ci) & (coverage_bin == di)
+                    margins[mask] = float(self.calibration_margins.get(
+                        f"clearance_{ci}_coverage_{di}", margins[mask][0] if np.any(mask) else 0.0
+                    ))
+        conservative = np.clip(speed - margins, 0.0, 1.0).astype(np.float32)
+        return speed, unsafe_probability, conservative
+
+    def calibrate_state_geometry(
+        self,
+        q: np.ndarray,
+        target_speed: np.ndarray,
+        clearance_m: np.ndarray,
+        coverage_distance: np.ndarray | None = None,
+    ) -> dict[str, float]:
+        from ur_mntfields_arm.online_training import calibrate_conservative_speed
+
+        pred, _unsafe, _conservative = self.predict_normalized_state_geometry(q)
+        margins = calibrate_conservative_speed(
+            pred, target_speed, clearance_m, coverage_distance=coverage_distance
+        )
+        self.calibration_margins = margins
+        return margins
+
+    def set_coverage_support(
+        self, states: np.ndarray, shell_radius: float, free_radius: float
+    ) -> None:
+        from scipy.spatial import cKDTree
+
+        values = np.asarray(states, dtype=np.float32).reshape(-1, self.dim)
+        if len(values):
+            values = np.unique(np.round(values, decimals=6), axis=0).astype(np.float32)
+        self.coverage_states = values
+        self.coverage_tree = cKDTree(values) if len(values) else None
+        if len(values):
+            # One representative per coarse C-space cell provides globally
+            # distributed detour candidates without scanning every replay
+            # state for every route. Lexicographic unique ordering makes this
+            # deterministic across save/load.
+            cell = np.floor((values + 0.5) / 0.08).astype(np.int16)
+            _cells, first = np.unique(cell, axis=0, return_index=True)
+            landmarks = values[np.sort(first)]
+            if len(landmarks) > 512:
+                choice = np.linspace(0, len(landmarks) - 1, 512, dtype=np.int64)
+                landmarks = landmarks[choice]
+            self.coverage_landmarks = landmarks.astype(np.float32, copy=False)
+        else:
+            self.coverage_landmarks = np.zeros((0, self.dim), dtype=np.float32)
+        self.shell_coverage_radius = float(np.clip(shell_radius, 0.0, 0.08))
+        self.free_coverage_radius = float(np.clip(free_radius, 0.0, 0.08))
 
     def predict_travel_times(
         self,
@@ -450,6 +638,45 @@ class ArmFieldModel:
         rows: np.ndarray | None = None,
         prediction: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None,
     ) -> dict[str, float]:
+        if rows is None and self.replay_buffer is not None and self.replay_buffer.shape[1] == 17:
+            state_rows = self._valid_replay_rows()
+            if len(state_rows) > max_rows:
+                state_rows = state_rows[np.random.choice(len(state_rows), int(max_rows), replace=False)]
+            if len(state_rows) == 0:
+                return {"diag_rows": 0.0}
+            target = np.clip(state_rows[:, 7], 0.0, 1.0)
+            pred, unsafe, conservative = self.predict_normalized_state_geometry(state_rows[:, :6])
+            low = target <= 0.20
+            free = target >= 0.50
+            diag = {
+                "diag_rows": float(len(state_rows)),
+                "speed_mae": float(np.mean(np.abs(pred - target))),
+                "speed_rmse": float(np.sqrt(np.mean((pred - target) ** 2))),
+                "speed_corr": self._safe_corr(pred, target),
+                "pred_speed_mean": float(np.mean(pred)),
+                "target_speed_mean": float(np.mean(target)),
+                "low_target_threshold": 0.20,
+                "low_target_overpred_frac": float(
+                    np.mean((conservative[low] >= 0.20) & (unsafe[low] < 0.10))
+                ) if np.any(low) else 0.0,
+                "low_target_count": float(np.count_nonzero(low)),
+                "unsafe_probability_mean": float(np.mean(unsafe)),
+                "unsafe_probability_low_mean": float(np.mean(unsafe[low])) if np.any(low) else 1.0,
+                "unsafe_probability_free_mean": float(np.mean(unsafe[free])) if np.any(free) else 1.0,
+                "free_target_count": float(np.count_nonzero(free)),
+                "free_speed_pass_rate": float(np.mean(conservative[free] >= 0.20)) if np.any(free) else 0.0,
+                "free_unsafe_pass_rate": float(np.mean(unsafe[free] < 0.10)) if np.any(free) else 0.0,
+                "free_state_recall": float(
+                    np.mean((conservative[free] >= 0.20) & (unsafe[free] < 0.10))
+                ) if np.any(free) else 0.0,
+                "false_blocked_free_rate": float(
+                    np.mean((conservative[free] < 0.20) | (unsafe[free] >= 0.10))
+                ) if np.any(free) else 1.0,
+                "normal_cos_mean": 0.0,
+                "normal_cos_near_mean": 0.0,
+            }
+            self.last_diagnostics = diag
+            return diag
         if rows is None:
             # Training independently reshuffles labelled endpoints on every
             # update. Saved sampler rows are intentionally local and critical
@@ -544,6 +771,13 @@ class ArmFieldModel:
         grid_size: int = 61,
         include_joint_slices: bool = True,
     ) -> list[Path]:
+        if self.replay_buffer is not None and self.replay_buffer.shape[1] == 17:
+            out_dir = Path(output_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            diag = self.evaluate_replay_diagnostics(max_rows=max_rows)
+            summary_path = out_dir / f"diagnostic_summary_{step_label}.json"
+            summary_path.write_text(json.dumps(diag, indent=2, sort_keys=True), encoding="utf-8")
+            return [summary_path]
         rows = self.reshuffle_pair_endpoints(self._valid_replay_rows())
         if rows.ndim != 2 or rows.shape[1] != 26 or len(rows) == 0:
             return []
@@ -709,11 +943,16 @@ class ArmFieldModel:
         plt.close(fig)
         return path
 
-    def save_checkpoint(self, checkpoint_path: str | Path):
+    def save_checkpoint(self, checkpoint_path: str | Path, metadata: dict[str, object] | None = None):
         checkpoint_path = Path(checkpoint_path)
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
+        checkpoint_metadata = dict(self.checkpoint_metadata)
+        if metadata:
+            checkpoint_metadata.update(metadata)
+        checkpoint_metadata.setdefault("certification_passed", bool(self.certification_passed))
+        persist_coverage = checkpoint_path.name in ("weights_final.pt", "weights_partial.pt")
+        coverage_states = self.coverage_states if persist_coverage else np.zeros((0, self.dim), dtype=np.float32)
+        payload = {
                 "network_state_dict": self.model.network.state_dict(),
                 "optimizer_state_dict": self.model.optimizer.state_dict(),
                 "B": self.model.B.detach().cpu(),
@@ -726,24 +965,38 @@ class ArmFieldModel:
                 "loss_config": dict(self.loss_config),
                 "loss_history": list(self.loss_history),
                 "total_epochs_trained": self.total_epochs_trained,
-            },
-            checkpoint_path,
-        )
+                "calibration_margins": dict(self.calibration_margins),
+                "coverage_states": torch.from_numpy(coverage_states.astype(np.float32)),
+                "shell_coverage_radius": float(self.shell_coverage_radius),
+                "free_coverage_radius": float(self.free_coverage_radius),
+                **checkpoint_metadata,
+            }
+        if checkpoint_path.name == "weights_final.pt" and not bool(payload.get("certification_passed")):
+            raise RuntimeError("weights_final.pt may only be saved after balanced certification passes")
+        torch.save(payload, checkpoint_path)
 
-    def load_checkpoint(self, checkpoint_path: str | Path):
+    def load_checkpoint(
+        self,
+        checkpoint_path: str | Path,
+        *,
+        certified_execution: bool = False,
+        current_scene_signature: str | None = None,
+        current_map_version: int | None = None,
+    ):
         checkpoint_path = Path(checkpoint_path)
         payload = torch.load(checkpoint_path, map_location=self.device)
         expected_architecture = str(
             getattr(self.model.network, "ARCHITECTURE_VERSION", "unknown")
         )
         checkpoint_architecture = payload.get("architecture_version")
-        if checkpoint_architecture != expected_architecture:
-            raise RuntimeError(
-                f"Checkpoint {checkpoint_path} uses architecture_version="
-                f"{checkpoint_architecture!r}; this runtime requires "
-                f"{expected_architecture!r}. Legacy metric-only checkpoints are "
-                "incompatible with the factorized arrival-time model and must be retrained."
-            )
+        legacy_architectures = {"pinn_factorized_t_v2"}
+        self.legacy_checkpoint = checkpoint_architecture in legacy_architectures
+        if checkpoint_architecture != expected_architecture and not self.legacy_checkpoint:
+            raise RuntimeError(f"Unsupported checkpoint architecture_version={checkpoint_architecture!r}")
+        if certified_execution and (
+            self.legacy_checkpoint or not bool(payload.get("certification_passed", False))
+        ):
+            raise RuntimeError("Certified learned-only execution requires a v3 state-geometry checkpoint with certification_passed=true")
         B = payload.get("B")
         if B is not None:
             self.model.B = B.to(self.device).float()
@@ -757,12 +1010,65 @@ class ArmFieldModel:
         network_state = payload.get("network_state_dict")
         if network_state is None:
             raise KeyError(f"Checkpoint missing network_state_dict: {checkpoint_path}")
-        self.model.network.load_state_dict(network_state, strict=True)
+        self.model.network.load_state_dict(network_state, strict=not self.legacy_checkpoint)
+        self.calibration_margins = {
+            str(k): float(v) for k, v in dict(payload.get("calibration_margins", {})).items()
+        }
+        self.certification_passed = bool(payload.get("certification_passed", False))
+        self.checkpoint_metadata = {
+            key: payload.get(key)
+            for key in (
+                "scene_signature", "voxel_map_path", "map_version",
+                "certification_metrics", "training_wall_time", "sample_source_counts",
+            )
+            if key in payload
+        }
+        if certified_execution:
+            self._validate_scene_artifact(
+                checkpoint_path,
+                current_scene_signature=current_scene_signature,
+                current_map_version=current_map_version,
+            )
+        coverage_payload = payload.get("coverage_states", torch.zeros((0, 6)))
+        if isinstance(coverage_payload, torch.Tensor):
+            coverage_payload = coverage_payload.detach().cpu().numpy()
+        self.set_coverage_support(
+            np.asarray(coverage_payload, dtype=np.float32),
+            float(payload.get("shell_coverage_radius", 0.0)),
+            float(payload.get("free_coverage_radius", 0.0)),
+        )
         optimizer_state = payload.get("optimizer_state_dict")
-        if optimizer_state is not None and self.model.optimizer is not None:
+        if optimizer_state is not None and self.model.optimizer is not None and not self.legacy_checkpoint:
             self.model.optimizer.load_state_dict(optimizer_state)
         self.loss_history = [float(v) for v in payload.get("loss_history", [])]
         self.total_epochs_trained = int(payload.get("total_epochs_trained", 0))
+
+    def _validate_scene_artifact(
+        self,
+        checkpoint_path: Path,
+        *,
+        current_scene_signature: str | None,
+        current_map_version: int | None,
+    ) -> None:
+        from ur_mntfields_arm.voxel_map import SparseVoxelMap
+
+        stored_path = self.checkpoint_metadata.get("voxel_map_path")
+        stored_signature = self.checkpoint_metadata.get("scene_signature")
+        stored_version = self.checkpoint_metadata.get("map_version")
+        if not stored_path or not stored_signature or stored_version is None:
+            raise RuntimeError("Certified checkpoint is missing its voxel map, scene signature, or map version")
+        artifact = Path(str(stored_path))
+        if not artifact.is_absolute():
+            artifact = checkpoint_path.parent / artifact
+        if not artifact.exists():
+            raise RuntimeError(f"Certified voxel map artifact does not exist: {artifact}")
+        voxel_map = SparseVoxelMap.load(artifact)
+        if voxel_map.scene_signature() != str(stored_signature) or voxel_map.map_version != int(stored_version):
+            raise RuntimeError("Certified checkpoint does not match its voxel map artifact")
+        if current_scene_signature is not None and str(current_scene_signature) != str(stored_signature):
+            raise RuntimeError("Current scene signature does not match the certified checkpoint")
+        if current_map_version is not None and int(current_map_version) != int(stored_version):
+            raise RuntimeError("Current scene map version does not match the certified checkpoint")
 
     def save_loss_plot(self, plot_path: str | Path):
         plot_path = Path(plot_path)
@@ -780,29 +1086,31 @@ class ArmFieldModel:
         plt.close()
 
     def gradient_rollout(self, q_start_norm: np.ndarray, q_goal_norm: np.ndarray, step_size: float = 0.04, max_steps: int = 160, tol: float = 0.01) -> np.ndarray:
-        q_src = torch.from_numpy(np.asarray(q_start_norm, dtype=np.float32))
-        q_tar = torch.from_numpy(np.asarray(q_goal_norm, dtype=np.float32))
+        """Integrate the learned field without a GPU/CPU round trip per step."""
+
+        q_src = torch.as_tensor(q_start_norm, dtype=torch.float32, device=self.device)
+        q_tar = torch.as_tensor(q_goal_norm, dtype=torch.float32, device=self.device)
         xp = torch.cat((q_src, q_tar), dim=0)
-        pts = [q_src.numpy().copy()]
-        reached = bool(np.linalg.norm(q_src.numpy() - q_goal_norm) < tol)
+        pts = [q_src.detach().clone()]
+        reached = bool(torch.linalg.vector_norm(q_src - q_tar).item() < tol)
         for _ in range(max_steps):
-            grad = self.model.function.Gradient(xp[None, :].to(self.device))[0].detach().cpu().numpy()
-            if not np.all(np.isfinite(grad[:6])):
+            grad = self.model.function.Gradient(xp[None, :])[0].detach()
+            with torch.no_grad():
+                xp = xp.detach().clone()
+                xp[:6].add_(float(step_size) * grad[:6])
+                xp[:6].clamp_(-0.5, 0.5)
+                valid = torch.all(torch.isfinite(grad[:6])) & torch.all(torch.isfinite(xp[:6]))
+                reached_now = torch.linalg.vector_norm(xp[:6] - q_tar) < float(tol)
+                status = torch.stack((valid, reached_now)).detach().cpu().numpy()
+            if not bool(status[0]):
                 break
-            xp_np = xp.numpy()
-            xp_np[:6] += step_size * grad[:6]
-            if not np.all(np.isfinite(xp_np[:6])):
-                break
-            xp_np[:6] = np.clip(xp_np[:6], -0.5, 0.5)
-            xp = torch.from_numpy(xp_np.astype(np.float32))
-            pts.append(xp_np[:6].copy())
-            if np.linalg.norm(xp_np[:6] - q_goal_norm) < tol:
+            pts.append(xp[:6].detach().clone())
+            if bool(status[1]):
                 reached = True
                 break
-        q_goal_norm = np.asarray(q_goal_norm, dtype=np.float32)
-        if reached and np.all(np.isfinite(q_goal_norm)):
-            pts.append(q_goal_norm.copy())
-        pts = np.asarray(pts, dtype=np.float32)
+        if reached and bool(torch.all(torch.isfinite(q_tar)).item()):
+            pts.append(q_tar.detach().clone())
+        pts = torch.stack(pts, dim=0).detach().cpu().numpy().astype(np.float32, copy=False)
         if pts.ndim != 2:
             return np.zeros((0, 6), dtype=np.float32)
         finite_mask = np.all(np.isfinite(pts), axis=1)

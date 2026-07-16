@@ -19,17 +19,22 @@ class Model:
         init_network: bool = True,
         eval: bool = False,
         lr: float = 1e-4,
-        td_loss_weight: float = 1.0e-3,
+        td_loss_weight: float = 1.0e-2,
         speed_loss_weight: float = 1.0e-2,
         log_speed_loss_weight: float = 0.0,
         direct_speed_loss_weight: float = 0.0,
-        normal_loss_weight: float = 1.0e-3,
+        normal_loss_weight: float = 0.0,
         normal_cos_loss_weight: float = 0.0,
         near_obstacle_loss_weight: float = 0.0,
         low_speed_threshold: float = 0.20,
         low_speed_pred_max: float = 0.35,
         low_speed_penalty_weight: float = 0.0,
         effective_speed_floor: float = 0.05,
+        state_clearance_loss_weight: float = 1.0,
+        unsafe_loss_weight: float = 0.5,
+        shell_normal_loss_weight: float = 0.1,
+        false_free_loss_weight: float = 2.0,
+        consistency_loss_weight: float = 0.01,
     ):
         self.folder = folder
         self.dim = dim
@@ -79,6 +84,11 @@ class Model:
             "low_speed_pred_max": float(low_speed_pred_max),
             "low_speed_penalty_weight": float(low_speed_penalty_weight),
             "effective_speed_floor": float(effective_speed_floor),
+            "state_clearance_loss_weight": float(state_clearance_loss_weight),
+            "unsafe_loss_weight": float(unsafe_loss_weight),
+            "shell_normal_loss_weight": float(shell_normal_loss_weight),
+            "false_free_loss_weight": float(false_free_loss_weight),
+            "consistency_loss_weight": float(consistency_loss_weight),
         }
         self.B = None
         self.last_loss = 1.0
@@ -100,6 +110,11 @@ class Model:
         )
         self.network = model_network.NN(self.Params["Device"], self.dim, self.B)
         self.network.apply(self.network.init_weights)
+        # Runtime certification uses p(unsafe) < 0.10. Start the binary head
+        # with a useful free-space prior instead of p=0.5 everywhere; focal
+        # BCE still supplies a large gradient for exact unsafe labels.
+        with torch.no_grad():
+            self.network.geometry_output.bias[1] = -2.9444389791664403
         self.network.float()
         self.network.to(self.Params["Device"])
         self.function = model_function.Function(
@@ -170,6 +185,93 @@ class Model:
         self.optimizer.step()
         self.epoch += 1
         self.last_loss = weighted_loss_n / float(total_rows)
+        return self.last_loss
+
+    def train_state_batch(self, state_data: torch.Tensor, pair_points: torch.Tensor):
+        """Optimize state geometry plus the goal-conditioned time objective.
+
+        State rows are ``q, clearance, speed, normal, unsafe, source,
+        map_version``.  Source and version select replay rows but intentionally
+        do not enter the network.
+        """
+        if state_data is None or len(state_data) == 0 or self.optimizer is None:
+            return None
+        data = state_data.to(self.device).float()
+        q = data[:, : self.dim].detach().requires_grad_(True)
+        target_speed = torch.clamp(data[:, self.dim + 1], 0.0, 1.0)
+        target_normal = data[:, self.dim + 2 : self.dim + 2 + self.dim]
+        target_unsafe = torch.clamp(data[:, self.dim + 2 + self.dim], 0.0, 1.0)
+        pred_speed, unsafe_logit = self.network.state_geometry(q)
+
+        cfg = self.loss_config
+        clearance_loss = torch.nn.functional.smooth_l1_loss(
+            pred_speed, target_speed, beta=0.05
+        )
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(
+            unsafe_logit, target_unsafe, reduction="none"
+        )
+        probability = torch.sigmoid(unsafe_logit)
+        pt = target_unsafe * probability + (1.0 - target_unsafe) * (1.0 - probability)
+        # Standard alpha-balanced focal BCE. Unsafe states are the positive
+        # class (alpha=0.25); verified-free states receive alpha=0.75 so the
+        # strict p(unsafe)<0.10 runtime gate does not converge fail-closed.
+        alpha_t = target_unsafe * 0.25 + (1.0 - target_unsafe) * 0.75
+        unsafe_loss = torch.mean(alpha_t * torch.square(1.0 - pt) * bce)
+        false_free = (target_speed <= 0.20).float() * torch.relu(
+            pred_speed - target_speed - 0.05
+        ).square()
+
+        grad = torch.autograd.grad(
+            pred_speed.sum(), q, create_graph=True, retain_graph=True
+        )[0]
+        grad_dir = grad / torch.linalg.vector_norm(grad, dim=1, keepdim=True).clamp_min(1.0e-8)
+        normal_norm = torch.linalg.vector_norm(target_normal, dim=1)
+        shell = ((data[:, self.dim] <= 0.03) & (normal_norm > 0.5)).float()
+        normal_cos = torch.sum(grad_dir * target_normal, dim=1)
+        normal_loss = torch.sum(shell * (1.0 - normal_cos)) / shell.sum().clamp_min(1.0)
+
+        # Re-form independent start/goal pairs for direction learning.  The
+        # state target is detached so time gradients cannot move the safety
+        # head toward a goal-dependent compromise.
+        pair_loss = torch.zeros((), device=self.device)
+        consistency = torch.zeros((), device=self.device)
+        if pair_points is not None and len(pair_points) > 0:
+            points = pair_points.to(self.device).float()
+            tau, _w, mapped = self.network.out(points)
+            arrival = self.function.arrival_time(tau, mapped)
+            dtime = self.function.gradient(arrival, mapped, create_graph=True)
+            time_speed0, time_speed1 = self.function._speed_from_time_gradient(dtime, self.dim)
+            idx0 = torch.arange(len(points), device=self.device) * 2
+            idx1 = idx0 + 1
+            state_target0 = pred_speed[idx0].detach()
+            state_target1 = pred_speed[idx1].detach()
+            consistency = 0.5 * (
+                torch.nn.functional.smooth_l1_loss(time_speed0, state_target0)
+                + torch.nn.functional.smooth_l1_loss(time_speed1, state_target1)
+            )
+            pair_targets = torch.stack((state_target0, state_target1), dim=1)
+            pair_normals = torch.cat((target_normal[idx0], target_normal[idx1]), dim=1)
+            # The existing travel-time/Eikonal objective retains its own 0.01
+            # weights. Geometry targets are detached; direction learning may
+            # not reshape the state safety head.
+            pair_loss, _pair_loss_n, _ = self.function.Loss(
+                points, pair_targets, pair_normals, beta=1.0, gamma=0.001, epoch=self.epoch
+            )
+
+        loss = (
+            float(cfg.get("state_clearance_loss_weight", 1.0)) * clearance_loss
+            + float(cfg.get("unsafe_loss_weight", 0.5)) * unsafe_loss
+            + float(cfg.get("shell_normal_loss_weight", 0.1)) * normal_loss
+            + float(cfg.get("false_free_loss_weight", 2.0)) * false_free.mean()
+            + pair_loss
+            + float(cfg.get("consistency_loss_weight", 0.01)) * consistency
+        )
+        self.network.train(True)
+        self.optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        self.optimizer.step()
+        self.epoch += 1
+        self.last_loss = float(loss.detach().item())
         return self.last_loss
 
     def train_core(self, epoch, frame_data=None, is_one_frame=True):

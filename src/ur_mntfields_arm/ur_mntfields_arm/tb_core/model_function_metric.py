@@ -41,11 +41,11 @@ class Function:
         limit = 0.5
         self.margin = limit / 15.0
         self.offset = self.margin / 10.0
-        self.td_loss_weight = 1.0e-3
+        self.td_loss_weight = 1.0e-2
         self.speed_loss_weight = 1.0e-2
         self.log_speed_loss_weight = 0.0
         self.direct_speed_loss_weight = 0.0
-        self.normal_loss_weight = 1.0e-3
+        self.normal_loss_weight = 0.0
         self.normal_cos_loss_weight = 0.0
         self.near_obstacle_loss_weight = 0.0
         self.low_speed_threshold = 0.20

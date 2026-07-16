@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, Shutdown
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
@@ -65,6 +65,7 @@ def generate_launch_description():
                 "scene_boxes_frame": scene_boxes_frame,
             },
         ],
+        on_exit=Shutdown(reason="online field training process exited"),
     )
 
     scene_boxes_publisher = Node(

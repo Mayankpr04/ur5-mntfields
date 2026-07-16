@@ -14,7 +14,14 @@ from ur_mntfields_arm.ur5_kinematics import UR5Kinematics
 class _LearnedSpeedChecker:
     """Planner edge oracle backed only by batched neural speed inference."""
 
-    def __init__(self, field_model: ArmFieldModel, kinematics: UR5Kinematics, q_target: np.ndarray):
+    def __init__(
+        self,
+        field_model: ArmFieldModel,
+        kinematics: UR5Kinematics,
+        q_target: np.ndarray,
+        *,
+        deadline_at: float | None = None,
+    ):
         self.field_model = field_model
         self.kinematics = kinematics
         self.q_target_n = kinematics.normalize(np.asarray(q_target, dtype=np.float64)).astype(np.float32)
@@ -22,6 +29,14 @@ class _LearnedSpeedChecker:
         self.query_states = 0
         self.requested_states = 0
         self._speed_cache: dict[bytes, float] = {}
+        self.rejected_unsafe = 0
+        self.rejected_coverage = 0
+        self.deadline_at = deadline_at
+        self.deadline_rejections = 0
+
+    @property
+    def expired(self) -> bool:
+        return self.deadline_at is not None and time.perf_counter() >= self.deadline_at
 
     def clearance_batch(self, q_batch: np.ndarray) -> np.ndarray:
         q = np.asarray(q_batch, dtype=np.float64)
@@ -30,6 +45,17 @@ class _LearnedSpeedChecker:
         if len(q) == 0:
             return np.zeros((0,), dtype=np.float32)
         qn = np.asarray([self.kinematics.normalize(row) for row in q], dtype=np.float32)
+        return self.clearance_normalized_batch(qn)
+
+    def clearance_normalized_batch(self, qn_batch: np.ndarray) -> np.ndarray:
+        """Evaluate already-normalized states without Python FK conversions."""
+        qn = np.asarray(qn_batch, dtype=np.float32).reshape(-1, 6)
+        if len(qn) == 0:
+            return np.zeros((0,), dtype=np.float32)
+        if self.expired:
+            self.deadline_rejections += int(len(qn))
+            return np.zeros((len(qn),), dtype=np.float32)
+        qn = np.clip(qn, -0.5, 0.5)
         self.requested_states += int(len(qn))
         keys = [np.ascontiguousarray(row).tobytes() for row in qn]
         missing_rows: list[np.ndarray] = []
@@ -42,8 +68,29 @@ class _LearnedSpeedChecker:
                 missing_rows.append(row)
         if missing_rows:
             query = np.asarray(missing_rows, dtype=np.float32)
-            goals = np.repeat(self.q_target_n[None, :], len(query), axis=0)
-            speed, _other = self.field_model.predict_normalized_pair_speeds(query, goals)
+            if hasattr(self.field_model, "predict_normalized_state_geometry"):
+                speed_raw, unsafe_probability, speed = self.field_model.predict_normalized_state_geometry(query)
+                speed = np.asarray(speed, dtype=np.float32)
+                unsafe_probability = np.asarray(unsafe_probability, dtype=np.float32)
+                unsafe_mask = unsafe_probability >= 0.10
+                self.rejected_unsafe += int(np.count_nonzero(unsafe_mask))
+                speed[unsafe_mask] = 0.0
+                tree = getattr(self.field_model, "coverage_tree", None)
+                if tree is None:
+                    coverage_mask = np.ones(len(query), dtype=bool)
+                else:
+                    distances, _indices = tree.query(query, k=1)
+                    shell_radius = float(getattr(self.field_model, "shell_coverage_radius", 0.0))
+                    free_radius = float(getattr(self.field_model, "free_coverage_radius", 0.0))
+                    radii = np.where(speed_raw < 0.5, shell_radius, free_radius)
+                    coverage_mask = np.asarray(distances) > radii
+                self.rejected_coverage += int(np.count_nonzero(coverage_mask))
+                speed[coverage_mask] = 0.0
+            else:
+                # Diagnostic compatibility for v2 fields and lightweight test
+                # doubles. Certified execution never takes this branch.
+                goals = np.repeat(self.q_target_n[None, :], len(query), axis=0)
+                speed, _other = self.field_model.predict_normalized_pair_speeds(query, goals)
             self.query_calls += 1
             self.query_states += int(len(query))
             for key, value in zip(missing_keys, np.asarray(speed, dtype=np.float32)):
@@ -65,10 +112,11 @@ class ArmFieldPlanner:
         self.score_goal_dist_weight = 5.0 #5.0
         self.score_depth_weight = 0.04
         self.score_clearance_weight = 0.0 #0.2
-        self.path_joint_edge_weight = 0.0
+        self.path_joint_edge_weight = 0.15
+        self.path_turn_weight = 0.25
         self.path_tool_edge_weight = 0.0
         self.path_tool_goal_weight = 0.0
-        self.path_clearance_penalty_weight = 0.0
+        self.path_clearance_penalty_weight = 20.0
         self.path_clearance_soft_margin_m = 0.04
         self.path_cost_return_first_goal = True
         self.bidirectional_forward_probe_fraction = 0.15
@@ -82,6 +130,14 @@ class ArmFieldPlanner:
         self.cartesian_shortcut_min_improvement = 0.01
         self.cartesian_shortcut_max_skip = 48
         self.cartesian_shortcut_try_reverse = False
+        # Collision geometry is evaluated in physical joint space.  Keeping the
+        # interpolation step independent of normalized joint spans prevents both
+        # missed narrow collisions and excessive sampling on short local edges.
+        self.planning_edge_step_rad = 0.10
+        self.final_edge_step_rad = 0.02
+        self.collision_smoothing_enabled = True
+        self.collision_smoothing_passes = 3
+        self.collision_smoothing_alpha = 0.35
 
     def set_score_weights(
         self,
@@ -90,6 +146,7 @@ class ArmFieldPlanner:
         depth: float | None = None,
         clearance: float | None = None,
         joint_edge: float | None = None,
+        turn: float | None = None,
         tool_edge: float | None = None,
         tool_goal: float | None = None,
         clearance_penalty: float | None = None,
@@ -117,6 +174,8 @@ class ArmFieldPlanner:
             self.score_clearance_weight = float(clearance)
         if joint_edge is not None:
             self.path_joint_edge_weight = float(joint_edge)
+        if turn is not None:
+            self.path_turn_weight = max(0.0, float(turn))
         if tool_edge is not None:
             self.path_tool_edge_weight = float(tool_edge)
             if tool_goal is None:
@@ -159,21 +218,50 @@ class ArmFieldPlanner:
         step_size_q: float,
         max_steps: int,
         mode: str = "bidirectional",
+        allow_direct_edge: bool = False,
+        min_predicted_speed: float = 0.20,
+        edge_check_step_rad: float = 0.04,
     ) -> np.ndarray:
         q_start_n = self.kinematics.normalize(q_start)
         q_goal_n = self.kinematics.normalize(q_goal)
         tol = max(0.01, 0.5 * float(step_size_q))
         mode_norm = str(mode).strip().lower()
+        direct_min_speed = float("nan")
+        direct_ms = 0.0
+        if allow_direct_edge:
+            direct_t0 = time.perf_counter()
+            direct_min_speed = self.learned_edge_min_speed(
+                q_start,
+                q_goal,
+                q_goal,
+                max_step_rad=edge_check_step_rad,
+            )
+            direct_ms = (time.perf_counter() - direct_t0) * 1.0e3
+        if allow_direct_edge and direct_min_speed >= float(min_predicted_speed):
+            self.last_debug = {
+                "status": "learned_direct_edge",
+                "planner": "field_only",
+                "search_direction": "direct",
+                "steps": 0,
+                "direct_edge_min_speed": float(direct_min_speed),
+                "direct_edge_infer_ms": float(direct_ms),
+            }
+            return np.asarray([q_start, q_goal], dtype=np.float32)
         if mode_norm in ("goal_to_start", "reverse_only", "goal_to_start_only"):
+            rollout_t0 = time.perf_counter()
             path_rev = self.field_model.gradient_rollout(
                 q_goal_n, q_start_n, step_size=step_size_q, max_steps=max_steps, tol=tol
             )
+            rollout_ms = (time.perf_counter() - rollout_t0) * 1.0e3
             if not self._path_reached_goal(path_rev, q_start_n, tol):
                 self.last_debug = {
                     "status": "field_only_goal_to_start_failed",
                     "planner": "field_only",
                     "search_direction": "goal_to_start",
                     "steps": int(max(0, len(path_rev) - 1)),
+                    "direct_edge_min_speed": float(direct_min_speed),
+                    "direct_edge_infer_ms": float(direct_ms),
+                    "gradient_rollout_ms": float(rollout_ms),
                     "last_goal_dist": float(
                         np.linalg.norm(np.asarray(path_rev[-1], dtype=np.float32) - q_start_n)
                     )
@@ -188,25 +276,254 @@ class ArmFieldPlanner:
                 "search_direction": "goal_to_start",
                 "steps": int(max(0, len(path_n) - 1)),
                 "last_goal_dist": 0.0,
+                "direct_edge_min_speed": float(direct_min_speed),
+                "direct_edge_infer_ms": float(direct_ms),
+                "gradient_rollout_ms": float(rollout_ms),
             }
             return np.asarray([self.kinematics.denormalize(qn) for qn in path_n], dtype=np.float32)
+        forward_t0 = time.perf_counter()
         path_fwd = self.field_model.gradient_rollout(
             q_start_n, q_goal_n, step_size=step_size_q, max_steps=max_steps, tol=tol
         )
+        forward_ms = (time.perf_counter() - forward_t0) * 1.0e3
         if mode_norm in ("forward", "forward_only", "start_to_goal"):
             if not self._path_reached_goal(path_fwd, q_goal_n, tol):
+                self.last_debug = {
+                    "status": "field_only_forward_failed",
+                    "planner": "field_only",
+                    "search_direction": "forward",
+                    "steps": int(max(0, len(path_fwd) - 1)),
+                    "direct_edge_min_speed": float(direct_min_speed),
+                    "direct_edge_infer_ms": float(direct_ms),
+                    "gradient_rollout_ms": float(forward_ms),
+                }
                 return np.zeros((0, 6), dtype=np.float32)
             path_n = self._ensure_endpoints(path_fwd, q_start_n, q_goal_n)
+            self.last_debug = {
+                "status": "field_only_forward_reached",
+                "planner": "field_only",
+                "search_direction": "forward",
+                "steps": int(max(0, len(path_n) - 1)),
+                "last_goal_dist": 0.0,
+                "direct_edge_min_speed": float(direct_min_speed),
+                "direct_edge_infer_ms": float(direct_ms),
+                "gradient_rollout_ms": float(forward_ms),
+            }
             return np.asarray([self.kinematics.denormalize(qn) for qn in path_n], dtype=np.float32)
         if mode_norm not in ("bidirectional", "bi", "merge"):
             raise ValueError(f"Unsupported planner mode: {mode}")
+        reverse_t0 = time.perf_counter()
         path_rev = self.field_model.gradient_rollout(
             q_goal_n, q_start_n, step_size=step_size_q, max_steps=max_steps, tol=tol
         )
+        reverse_ms = (time.perf_counter() - reverse_t0) * 1.0e3
         path_n = self._merge_bidirectional_paths(path_fwd, path_rev, q_start_n, q_goal_n, bridge_tol=max(2.0 * tol, 1.5 * float(step_size_q)))
         if path_n.size == 0:
+            self.last_debug = {
+                "status": "field_only_bidirectional_failed",
+                "planner": "field_only",
+                "search_direction": "bidirectional",
+                "direct_edge_min_speed": float(direct_min_speed),
+                "direct_edge_infer_ms": float(direct_ms),
+                "forward_rollout_ms": float(forward_ms),
+                "reverse_rollout_ms": float(reverse_ms),
+            }
             return np.zeros((0, 6), dtype=np.float32)
+        self.last_debug = {
+            "status": "field_only_bidirectional_reached",
+            "planner": "field_only",
+            "search_direction": "bidirectional",
+            "steps": int(max(0, len(path_n) - 1)),
+            "last_goal_dist": 0.0,
+            "direct_edge_min_speed": float(direct_min_speed),
+            "direct_edge_infer_ms": float(direct_ms),
+            "forward_rollout_ms": float(forward_ms),
+            "reverse_rollout_ms": float(reverse_ms),
+        }
         return np.asarray([self.kinematics.denormalize(qn) for qn in path_n], dtype=np.float32)
+
+    def learned_edge_min_speed(
+        self,
+        q_start: np.ndarray,
+        q_end: np.ndarray,
+        q_goal: np.ndarray,
+        max_step_rad: float = 0.04,
+    ) -> float:
+        """Return the minimum learned speed along a densely sampled joint edge."""
+
+        qa = np.asarray(q_start, dtype=np.float64).reshape(6)
+        qb = np.asarray(q_end, dtype=np.float64).reshape(6)
+        max_delta = float(np.max(np.abs(qb - qa)))
+        segments = max(1, int(np.ceil(max_delta / max(0.01, float(max_step_rad)))))
+        edge = np.linspace(qa, qb, segments + 1, dtype=np.float64)
+        edge_n = np.asarray([self.kinematics.normalize(row) for row in edge], dtype=np.float32)
+        if hasattr(self.field_model, "predict_normalized_state_geometry"):
+            oracle = _LearnedSpeedChecker(self.field_model, self.kinematics, q_goal)
+            speed = oracle.clearance_batch(edge)
+            if len(speed) != len(edge_n) or not np.all(np.isfinite(speed)):
+                return float("-inf")
+            return float(np.min(speed))
+        goal_n = self.kinematics.normalize(np.asarray(q_goal, dtype=np.float64)).astype(np.float32)
+        goals = np.repeat(goal_n[None, :], len(edge_n), axis=0)
+        speed, _ = self.field_model.predict_normalized_pair_speeds(edge_n, goals, batch_size=2048)
+        if len(speed) != len(edge_n) or not np.all(np.isfinite(speed)):
+            return float("-inf")
+        return float(np.min(speed))
+
+    def learned_state_speeds(
+        self,
+        q_batch: np.ndarray,
+        q_target: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Evaluate the certified state/coverage oracle for physical states."""
+        q = np.asarray(q_batch, dtype=np.float64).reshape(-1, 6)
+        if len(q) == 0:
+            return np.zeros((0,), dtype=np.float32)
+        target = q[0] if q_target is None else np.asarray(q_target, dtype=np.float64)
+        oracle = _LearnedSpeedChecker(self.field_model, self.kinematics, target)
+        return oracle.clearance_batch(q)
+
+    def _learned_replay_bridge(
+        self,
+        checker: _LearnedSpeedChecker,
+        q_start: np.ndarray,
+        q_goal: np.ndarray,
+        *,
+        threshold: float,
+        step_size_q: float,
+        max_candidates: int,
+    ) -> np.ndarray:
+        """Evaluate direct/two-leg supported routes in one neural batch."""
+        q_start_n = self.kinematics.normalize(q_start).astype(np.float32)
+        q_goal_n = self.kinematics.normalize(q_goal).astype(np.float32)
+        midpoint = 0.5 * (q_start_n + q_goal_n)
+        coverage = np.asarray(
+            getattr(self.field_model, "coverage_states", np.zeros((0, 6))),
+            dtype=np.float32,
+        ).reshape(-1, 6)
+        anchors = [midpoint]
+        if len(coverage):
+            # Retrieve a bounded local neighborhood from the replay index and
+            # combine it with a small set of global cell landmarks. The old
+            # implementation computed two norms across every 200k+ replay
+            # state for every attempted route.
+            tree = getattr(self.field_model, "coverage_tree", None)
+            local_indices = np.zeros((0,), dtype=np.int64)
+            if tree is not None:
+                query_k = min(16, len(coverage))
+                _distance, indices = tree.query(
+                    np.stack((q_start_n, midpoint, q_goal_n)), k=query_k
+                )
+                local_indices = np.unique(np.asarray(indices, dtype=np.int64).reshape(-1))
+                local_indices = local_indices[local_indices < len(coverage)]
+            landmarks = np.asarray(
+                getattr(self.field_model, "coverage_landmarks", np.zeros((0, 6))),
+                dtype=np.float32,
+            ).reshape(-1, 6)
+            if not len(landmarks):
+                stride = max(1, int(np.ceil(len(coverage) / 64.0)))
+                landmarks = coverage[::stride][:64]
+            bounded = np.concatenate((coverage[local_indices], landmarks), axis=0)
+            bounded = np.unique(np.round(bounded, decimals=6), axis=0).astype(np.float32)
+            route_cost = (
+                np.linalg.norm(bounded - q_start_n[None, :], axis=1)
+                + np.linalg.norm(bounded - q_goal_n[None, :], axis=1)
+            )
+            take = min(max(1, int(max_candidates)), len(bounded))
+            shortest_take = max(1, take // 2)
+            shortest = np.argpartition(route_cost, shortest_take - 1)[:shortest_take]
+            pool_take = min(len(bounded), max(take, 128))
+            pool = np.argpartition(route_cost, pool_take - 1)[:pool_take]
+            direction = q_goal_n - q_start_n
+            direction_norm_sq = float(np.dot(direction, direction))
+            if direction_norm_sq > 1.0e-8:
+                rel = bounded[pool] - q_start_n[None, :]
+                projection = (
+                    (rel @ direction) / direction_norm_sq
+                )[:, None] * direction[None, :]
+                deviation = np.linalg.norm(rel - projection, axis=1)
+            else:
+                deviation = np.linalg.norm(bounded[pool] - midpoint[None, :], axis=1)
+            detour_take = min(take - shortest_take, len(pool))
+            detour = pool[np.argsort(deviation)[-detour_take:]] if detour_take else np.zeros(0, dtype=int)
+            idx = np.unique(np.concatenate((shortest, detour)))
+            anchors.extend(bounded[idx])
+        anchors_n = np.unique(np.round(np.asarray(anchors), decimals=6), axis=0).astype(np.float32)
+
+        # Coarse stage: reject unsafe/unsupported anchor states cheaply, then
+        # densely validate only a handful of complete two-leg routes.  The
+        # previous implementation expanded all 64 routes into thousands of
+        # interpolation states before its first inference call.
+        anchor_speed = checker.clearance_normalized_batch(anchors_n)
+        if len(anchor_speed) != len(anchors_n) or checker.expired:
+            return np.zeros((0, 6), dtype=np.float32)
+        viable_anchor = np.flatnonzero(
+            np.isfinite(anchor_speed) & (anchor_speed >= float(threshold))
+        )
+        if not len(viable_anchor):
+            return np.zeros((0, 6), dtype=np.float32)
+        coarse_cost = (
+            np.linalg.norm(anchors_n[viable_anchor] - q_start_n[None, :], axis=1)
+            + np.linalg.norm(anchors_n[viable_anchor] - q_goal_n[None, :], axis=1)
+            - 0.05 * anchor_speed[viable_anchor]
+        )
+        dense_count = min(8, len(viable_anchor))
+        short_count = min(max(1, dense_count // 2), len(viable_anchor))
+        short_local = np.argsort(coarse_cost)[:short_count]
+        direction = q_goal_n - q_start_n
+        direction_norm_sq = float(np.dot(direction, direction))
+        rel = anchors_n[viable_anchor] - q_start_n[None, :]
+        if direction_norm_sq > 1.0e-8:
+            projection = ((rel @ direction) / direction_norm_sq)[:, None] * direction[None, :]
+            deviation = np.linalg.norm(rel - projection, axis=1)
+        else:
+            deviation = np.linalg.norm(rel, axis=1)
+        detour_local = np.argsort(deviation)[-(dense_count - short_count):]
+        selected_local = np.unique(np.concatenate((short_local, detour_local)))
+        if len(selected_local) < dense_count:
+            remainder = [i for i in np.argsort(coarse_cost) if i not in set(selected_local.tolist())]
+            selected_local = np.concatenate(
+                (selected_local, np.asarray(remainder[: dense_count - len(selected_local)], dtype=int))
+            )
+        selected_anchor_idx = viable_anchor[selected_local[:dense_count]]
+        dense_anchors = anchors_n[selected_anchor_idx]
+
+        rows: list[np.ndarray] = []
+        spans: list[tuple[int, int, int, int]] = []
+        cursor = 0
+        step = max(0.01, float(step_size_q))
+        for anchor in dense_anchors:
+            n0 = max(1, int(np.ceil(np.max(np.abs(anchor - q_start_n)) / step)))
+            n1 = max(1, int(np.ceil(np.max(np.abs(q_goal_n - anchor)) / step)))
+            first = np.linspace(q_start_n, anchor, n0 + 1, dtype=np.float32)
+            second = np.linspace(anchor, q_goal_n, n1 + 1, dtype=np.float32)
+            rows.extend((first, second))
+            spans.append((cursor, cursor + len(first), cursor + len(first), cursor + len(first) + len(second)))
+            cursor += len(first) + len(second)
+        if not rows or checker.expired:
+            return np.zeros((0, 6), dtype=np.float32)
+        qn = np.concatenate(rows, axis=0)
+        speed = checker.clearance_normalized_batch(qn)
+        if len(speed) != len(qn) or checker.expired:
+            return np.zeros((0, 6), dtype=np.float32)
+        viable: list[tuple[float, float, int]] = []
+        for index, (a0, a1, b0, b1) in enumerate(spans):
+            bottleneck = min(float(np.min(speed[a0:a1])), float(np.min(speed[b0:b1])))
+            if np.isfinite(bottleneck) and bottleneck >= float(threshold):
+                anchor = dense_anchors[index]
+                length = float(
+                    np.linalg.norm(anchor - q_start_n) + np.linalg.norm(q_goal_n - anchor)
+                )
+                viable.append((length, -bottleneck, index))
+        if not viable:
+            return np.zeros((0, 6), dtype=np.float32)
+        _length, _negative_bottleneck, best = min(viable)
+        anchor = dense_anchors[best]
+        if np.max(np.abs(anchor - midpoint)) <= 1.0e-5:
+            return np.asarray([q_start, q_goal], dtype=np.float32)
+        return np.asarray(
+            [q_start, self.kinematics.denormalize(anchor), q_goal], dtype=np.float32
+        )
 
     def _path_reached_goal(self, path: np.ndarray, q_goal_n: np.ndarray, tol: float) -> bool:
         pts = np.asarray(path, dtype=np.float32)
@@ -535,6 +852,7 @@ class ArmFieldPlanner:
         max_local_candidates: int = 32,
         allow_direct_edge: bool = False,
         mode: str = "bidirectional",
+        time_budget_ms: float = 90.0,
     ) -> np.ndarray:
         """Search using neural speed as the only edge-validity signal.
 
@@ -543,11 +861,40 @@ class ArmFieldPlanner:
         """
         mode_norm = str(mode).strip().lower()
         threshold = float(np.clip(min_predicted_speed, 0.0, 1.0))
+        deadline_at = time.perf_counter() + max(1.0, float(time_budget_ms)) * 1.0e-3
+
+        bridge_checker = _LearnedSpeedChecker(
+            self.field_model, self.kinematics, q_goal, deadline_at=deadline_at
+        )
+        bridge = self._learned_replay_bridge(
+            bridge_checker,
+            q_start,
+            q_goal,
+            threshold=threshold,
+            step_size_q=step_size_q,
+            max_candidates=min(64, max(8, 2 * int(max_local_candidates))),
+        )
+        if len(bridge):
+            self.last_debug = {
+                "status": "learned_replay_bridge",
+                "planner": "learned_speed_search",
+                "steps": 0,
+                "bridge_waypoints": int(len(bridge)),
+                "geometric_collision_queries": 0,
+                "learned_speed_query_calls": int(bridge_checker.query_calls),
+                "learned_speed_query_states": int(bridge_checker.query_states),
+                "learned_unsafe_rejections": int(bridge_checker.rejected_unsafe),
+                "learned_coverage_rejections": int(bridge_checker.rejected_coverage),
+                "time_budget_ms": float(time_budget_ms),
+            }
+            return bridge
 
         def _run(direction: str) -> tuple[np.ndarray, dict[str, object], _LearnedSpeedChecker]:
             reverse = direction == "goal_to_start"
             target = q_start if reverse else q_goal
-            learned = _LearnedSpeedChecker(self.field_model, self.kinematics, target)
+            learned = _LearnedSpeedChecker(
+                self.field_model, self.kinematics, target, deadline_at=deadline_at
+            )
             path = self.plan_collision_aware(
                 learned,
                 q_start,
@@ -570,6 +917,10 @@ class ArmFieldPlanner:
                     "learned_speed_requested_states": int(learned.requested_states),
                     "learned_speed_cache_hits": int(learned.requested_states - learned.query_states),
                     "min_predicted_speed": threshold,
+                    "learned_unsafe_rejections": int(learned.rejected_unsafe),
+                    "learned_coverage_rejections": int(learned.rejected_coverage),
+                    "learned_deadline_rejections": int(learned.deadline_rejections),
+                    "time_budget_ms": float(time_budget_ms),
                 }
             )
             return path, debug, learned
@@ -606,6 +957,11 @@ class ArmFieldPlanner:
                 self.last_debug = forward_debug
                 self.last_debug["search_direction"] = "forward"
                 return forward
+            if time.perf_counter() >= deadline_at:
+                self.last_debug = forward_debug
+                self.last_debug["status"] = "learned_time_budget"
+                self.last_debug["search_direction"] = "forward_timeout"
+                return np.zeros((0, 6), dtype=np.float32)
             reverse, reverse_debug, _reverse_checker = _run("goal_to_start")
         finally:
             (
@@ -1016,6 +1372,15 @@ class ArmFieldPlanner:
         best_idx = 0
 
         for expansion_idx in range(max_expansions):
+            if bool(getattr(checker, "expired", False)):
+                self.last_debug.update(
+                    {
+                        "status": "learned_time_budget",
+                        "steps": int(expansion_idx),
+                        "last_goal_dist": best_goal_dist,
+                    }
+                )
+                return np.zeros((0, 6), dtype=np.float32)
             if not heap:
                 self.last_debug.update({"status": "cartesian_graph_frontier_empty", "steps": int(expansion_idx)})
                 break
@@ -1071,14 +1436,20 @@ class ArmFieldPlanner:
             candidates = self._append_cartesian_step_candidates(candidates, q_cur_n, q_goal_n, float(step_size_q))
             if len(candidates) == 0:
                 continue
-            edge_mins = self._edge_min_clearances(checker, q_cur_n, candidates, float(step_size_q))
+            edge_mins, clearances = self._edge_min_clearances(
+                checker, q_cur_n, candidates, float(step_size_q), return_endpoints=True
+            )
+            if bool(getattr(checker, "expired", False)):
+                self.last_debug.update(
+                    {
+                        "status": "learned_time_budget",
+                        "steps": int(expansion_idx + 1),
+                        "last_goal_dist": best_goal_dist,
+                    }
+                )
+                return np.zeros((0, 6), dtype=np.float32)
             edge_ok = edge_mins >= float(clearance_margin_m)
             q_phys = np.asarray([self.kinematics.denormalize(qn) for qn in candidates], dtype=np.float32)
-            clearance_t0 = time.perf_counter()
-            clearances = checker.clearance_batch(q_phys)
-            self._add_debug_ms("candidate_clearance_ms", clearance_t0)
-            self._inc_debug("candidate_clearance_calls", 1)
-            self._inc_debug("candidate_clearance_states", len(q_phys))
             tool_t0 = time.perf_counter()
             cand_tools = np.asarray([self.kinematics.fk(q)[:3, 3] for q in q_phys], dtype=np.float32)
             self._add_debug_ms("cartesian_graph_candidate_fk_ms", tool_t0)
@@ -1248,10 +1619,8 @@ class ArmFieldPlanner:
         if float(tau_weight) != 0.0:
             q_pair_goal = np.asarray(q_goal_n, dtype=np.float32)[None, :]
             q_pair = np.asarray(q_n, dtype=np.float32)[None, :]
-            self._sync_model_device()
             infer_t0 = time.perf_counter()
             tau_cost = float(self.field_model.predict_travel_times(q_pair, q_pair_goal)[0])
-            self._sync_model_device()
             self._add_debug_ms("cartesian_graph_tau_infer_ms", infer_t0)
             self._inc_debug("cartesian_graph_tau_infer_calls", 1)
             self._inc_debug("cartesian_graph_tau_infer_pairs", 1)
@@ -1339,6 +1708,15 @@ class ArmFieldPlanner:
         )
 
         for expansion_idx in range(max_expansions):
+            if bool(getattr(checker, "expired", False)):
+                self.last_debug.update(
+                    {
+                        "status": "learned_time_budget",
+                        "steps": int(expansion_idx),
+                        "last_goal_dist": best_goal_dist,
+                    }
+                )
+                return np.zeros((0, 6), dtype=np.float32)
             if not heap:
                 self.last_debug.update({"status": "frontier_empty", "steps": int(expansion_idx), "last_goal_dist": best_goal_dist})
                 break
@@ -1427,14 +1805,20 @@ class ArmFieldPlanner:
             candidates = self._append_cartesian_step_candidates(candidates, q_cur_n, q_goal_n, float(step_size_q))
             if len(candidates) == 0:
                 continue
-            edge_mins = self._edge_min_clearances(checker, q_cur_n, candidates, float(step_size_q))
+            edge_mins, clearances = self._edge_min_clearances(
+                checker, q_cur_n, candidates, float(step_size_q), return_endpoints=True
+            )
+            if bool(getattr(checker, "expired", False)):
+                self.last_debug.update(
+                    {
+                        "status": "learned_time_budget",
+                        "steps": int(expansion_idx + 1),
+                        "last_goal_dist": best_goal_dist,
+                    }
+                )
+                return np.zeros((0, 6), dtype=np.float32)
             edge_ok = edge_mins >= float(clearance_margin_m)
             q_phys = np.asarray([self.kinematics.denormalize(qn) for qn in candidates], dtype=np.float32)
-            clearance_t0 = time.perf_counter()
-            clearances = checker.clearance_batch(q_phys)
-            self._add_debug_ms("candidate_clearance_ms", clearance_t0)
-            self._inc_debug("candidate_clearance_calls", 1)
-            self._inc_debug("candidate_clearance_states", len(q_phys))
             goal_dists_all = np.linalg.norm(candidates - q_goal_n[None, :], axis=1)
             if len(clearances):
                 self.last_debug["best_candidate_clearance"] = max(
@@ -1468,6 +1852,8 @@ class ArmFieldPlanner:
                 clearance_margin_m,
             )
             edge_costs = self._edge_path_costs(q_cur_n, valid_candidates, valid_edge_mins, clearance_margin_m)
+            if self.path_turn_weight != 0.0 and int(parents[node_idx]) >= 0:
+                edge_costs += self._turn_path_costs(nodes[int(parents[node_idx])], q_cur_n, valid_candidates)
             candidate_g_costs = float(costs[node_idx]) + edge_costs
             valid_scores = candidate_g_costs + heuristic_scores
             if expansion_idx == 0:
@@ -1595,6 +1981,23 @@ class ArmFieldPlanner:
             out += float(self.path_clearance_penalty_weight) * (soft_violation * soft_violation).astype(np.float32)
         return out
 
+    def _turn_path_costs(
+        self,
+        q_parent_n: np.ndarray,
+        q_cur_n: np.ndarray,
+        candidates_n: np.ndarray,
+    ) -> np.ndarray:
+        incoming = np.asarray(q_cur_n, dtype=np.float32) - np.asarray(q_parent_n, dtype=np.float32)
+        incoming_norm = float(np.linalg.norm(incoming))
+        candidates = np.asarray(candidates_n, dtype=np.float32).reshape(-1, 6)
+        if incoming_norm <= 1.0e-8 or len(candidates) == 0:
+            return np.zeros((len(candidates),), dtype=np.float32)
+        outgoing = candidates - np.asarray(q_cur_n, dtype=np.float32)[None, :]
+        outgoing_norm = np.linalg.norm(outgoing, axis=1)
+        denom = np.maximum(incoming_norm * outgoing_norm, 1.0e-8)
+        cosine = np.clip((outgoing @ incoming) / denom, -1.0, 1.0)
+        return (float(self.path_turn_weight) * (1.0 - cosine)).astype(np.float32)
+
     def _tool_xyz_from_normalized(self, q_n: np.ndarray) -> np.ndarray:
         q_n = np.asarray(q_n, dtype=np.float32)
         if q_n.ndim == 1:
@@ -1606,14 +2009,13 @@ class ArmFieldPlanner:
         xp = torch.from_numpy(np.concatenate((q_cur_n, q_goal_n), axis=0)[None, :].astype(np.float32)).to(
             self.field_model.device
         )
-        self._sync_model_device()
         infer_t0 = time.perf_counter()
         grad = self.field_model.model.function.Gradient(xp)
-        self._sync_model_device()
+        grad_np = grad[0, :6].detach().cpu().numpy().astype(np.float32)
         self._add_debug_ms("gradient_infer_ms", infer_t0)
         self._inc_debug("gradient_infer_calls", 1)
         self._inc_debug("gradient_infer_pairs", 1)
-        return grad[0, :6].detach().cpu().numpy().astype(np.float32)
+        return grad_np
 
     def _field_search_priority(
         self,
@@ -1644,6 +2046,7 @@ class ArmFieldPlanner:
             return np.zeros((0,), dtype=np.float32)
         path_cost_mode = (
             self.path_joint_edge_weight != 0.0
+            or self.path_turn_weight != 0.0
             or self.path_tool_edge_weight != 0.0
             or self.path_tool_goal_weight != 0.0
         )
@@ -1651,10 +2054,8 @@ class ArmFieldPlanner:
             tau = np.zeros((len(candidates_n),), dtype=np.float32)
         else:
             q_goals = np.repeat(np.asarray(q_goal_n, dtype=np.float32)[None, :], len(candidates_n), axis=0)
-            self._sync_model_device()
             infer_t0 = time.perf_counter()
             tau = self.field_model.predict_travel_times(candidates_n, q_goals)
-            self._sync_model_device()
             self._add_debug_ms("tau_infer_ms", infer_t0)
             self._inc_debug("tau_infer_calls", 1)
             self._inc_debug("tau_infer_pairs", len(candidates_n))
@@ -1708,7 +2109,7 @@ class ArmFieldPlanner:
         if not self.cartesian_shortcut_enabled:
             self.last_debug["cartesian_shortcut_enabled"] = False
             self.last_debug["cartesian_shortcut_accepted"] = False
-            return baseline
+            return self._smooth_collision_path(checker, baseline, clearance_margin_m)
 
         opt_t0 = time.perf_counter()
         candidate = self._cartesian_shortcut_path(checker, pts, clearance_margin_m, step_size_q)
@@ -1729,7 +2130,7 @@ class ArmFieldPlanner:
         self.last_debug["cartesian_shortcut_candidate_cost"] = float(cand_cost)
         self.last_debug["cartesian_shortcut_improvement"] = float(improvement)
         self.last_debug["cartesian_shortcut_candidate_waypoints"] = int(len(candidate))
-        return np.asarray(out, dtype=np.float32)
+        return self._smooth_collision_path(checker, np.asarray(out, dtype=np.float32), clearance_margin_m)
 
     def _cartesian_path_quality_cost(self, path: np.ndarray) -> float:
         pts = np.asarray(path, dtype=np.float32)
@@ -1850,16 +2251,90 @@ class ArmFieldPlanner:
         out = [pts[0].copy()]
         cur = 0
         while cur < len(pts) - 1:
+            # Test a window of possible shortcuts in one checker batch.  The old
+            # farthest-first loop launched one GPU query for every failed edge.
+            end = min(len(pts), cur + max(2, int(getattr(self, "cartesian_shortcut_max_skip", 48))) + 1)
+            cand_indices = np.arange(cur + 1, end, dtype=np.int32)
+            q_cur_n = self.kinematics.normalize(pts[cur])
             next_idx = cur + 1
-            for cand_idx in range(len(pts) - 1, cur, -1):
-                q_cur_n = self.kinematics.normalize(pts[cur])
-                q_cand_n = self.kinematics.normalize(pts[cand_idx])
-                edge = self._edge_min_clearances(checker, q_cur_n, q_cand_n[None, :], float(step_size_q))
-                if edge.size > 0 and float(edge[0]) >= float(clearance_margin_m):
-                    next_idx = cand_idx
+            # Check farthest candidates first, eight at a time.  This retains
+            # GPU batching without evaluating every long edge when an early
+            # far shortcut succeeds.
+            descending = cand_indices[::-1]
+            for chunk_start in range(0, len(descending), 8):
+                chunk = descending[chunk_start : chunk_start + 8]
+                q_cand_n = np.asarray([self.kinematics.normalize(pts[i]) for i in chunk], dtype=np.float32)
+                edge = self._edge_min_clearances(checker, q_cur_n, q_cand_n, float(step_size_q))
+                valid = np.flatnonzero(edge >= float(clearance_margin_m))
+                if len(valid):
+                    next_idx = int(chunk[int(valid[0])])
                     break
             out.append(pts[next_idx].copy())
             cur = next_idx
+        return np.asarray(out, dtype=np.float32)
+
+    def _smooth_collision_path(
+        self,
+        checker: UR5PointCloudCollisionChecker,
+        path: np.ndarray,
+        clearance_margin_m: float,
+    ) -> np.ndarray:
+        """Remove sharp joint-space corners without relaxing the safety margin."""
+        pts = np.asarray(path, dtype=np.float32)
+        if (
+            pts.ndim != 2
+            or len(pts) <= 2
+            or not bool(getattr(self, "collision_smoothing_enabled", True))
+        ):
+            return pts
+        original = pts.copy()
+        out = pts.copy()
+        alpha = float(np.clip(getattr(self, "collision_smoothing_alpha", 0.35), 0.0, 1.0))
+        passes = max(0, int(getattr(self, "collision_smoothing_passes", 8)))
+        accepted = 0
+        smooth_t0 = time.perf_counter()
+        for _pass in range(passes):
+            changed = False
+            # Alternating non-adjacent corners means every accepted connecting
+            # segment was present in the same batched validation query.
+            for parity in (0, 1):
+                indices = np.arange(1 + parity, len(out) - 1, 2, dtype=np.int32)
+                if len(indices) == 0:
+                    continue
+                current = out[indices]
+                proposal = (1.0 - alpha) * current + alpha * 0.5 * (out[indices - 1] + out[indices + 1])
+                starts = np.vstack((out[indices - 1], proposal)).astype(np.float32)
+                ends = np.vstack((proposal, out[indices + 1])).astype(np.float32)
+                mins, _endpoints = self._physical_segments_min_clearances(checker, starts, ends)
+                n = len(indices)
+                safe = (mins[:n] >= float(clearance_margin_m)) & (mins[n:] >= float(clearance_margin_m))
+                old_curve = np.linalg.norm(out[indices - 1] - 2.0 * current + out[indices + 1], axis=1)
+                new_curve = np.linalg.norm(out[indices - 1] - 2.0 * proposal + out[indices + 1], axis=1)
+                improve = new_curve < old_curve - 1.0e-7
+                take = safe & improve
+                if np.any(take):
+                    out[indices[take]] = proposal[take]
+                    accepted += int(np.count_nonzero(take))
+                    changed = True
+            if not changed:
+                break
+
+        # A single batched whole-path check is the final invariant.  Any numeric
+        # or checker inconsistency falls back to the already-valid shortcut path.
+        if len(out) > 1:
+            final_step = float(getattr(self, "final_edge_step_rad", 0.02))
+            final_mins, _ = self._physical_segments_min_clearances(
+                checker, out[:-1], out[1:], max_step_rad=final_step
+            )
+            if len(final_mins) != len(out) - 1 or np.any(final_mins < float(clearance_margin_m)):
+                original_mins, _ = self._physical_segments_min_clearances(
+                    checker, original[:-1], original[1:], max_step_rad=final_step
+                )
+                out = original if np.all(original_mins >= float(clearance_margin_m)) else np.zeros((0, 6), dtype=np.float32)
+                accepted = 0
+        self._add_debug_ms("collision_smoothing_ms", smooth_t0)
+        self.last_debug["collision_smoothing_accepted_corners"] = int(accepted)
+        self.last_debug["collision_smoothing_enabled"] = True
         return np.asarray(out, dtype=np.float32)
 
     def _edge_min_clearances(
@@ -1868,42 +2343,71 @@ class ArmFieldPlanner:
         q_cur_n: np.ndarray,
         candidates_n: np.ndarray,
         step_size_q: float,
-    ) -> np.ndarray:
-        # ``step_size_q`` and both endpoint arrays are in normalized C-space.
-        # Segmenting after denormalization incorrectly interpreted that value as
-        # radians and oversampled every short local edge by roughly an order of
-        # magnitude.  Interpolate at half a planner step in the same normalized
-        # coordinates, then denormalize only the batched network query states.
-        max_delta_step_n = max(0.01, 0.5 * step_size_q)
+        *,
+        return_endpoints: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+        del step_size_q  # search resolution and collision resolution are independent
         q_cur_n = np.asarray(q_cur_n, dtype=np.float32)
         candidates_n = np.asarray(candidates_n, dtype=np.float32)
         if candidates_n.ndim == 1:
             candidates_n = candidates_n[None, :]
         if len(candidates_n) == 0:
-            return np.zeros((0,), dtype=np.float32)
-        max_deltas_n = np.max(np.abs(candidates_n - q_cur_n[None, :]), axis=1)
-        nsegs = np.maximum(1, np.ceil(max_deltas_n / max_delta_step_n).astype(np.int32))
+            empty = np.zeros((0,), dtype=np.float32)
+            return (empty, empty) if return_endpoints else empty
+        start = np.asarray(self.kinematics.denormalize(q_cur_n), dtype=np.float32)
+        ends = np.asarray([self.kinematics.denormalize(row) for row in candidates_n], dtype=np.float32)
+        starts = np.repeat(start[None, :], len(ends), axis=0)
+        mins, endpoint_clearances = self._physical_segments_min_clearances(checker, starts, ends)
+        return (mins, endpoint_clearances) if return_endpoints else mins
+
+    def _physical_segments_min_clearances(
+        self,
+        checker: UR5PointCloudCollisionChecker,
+        starts: np.ndarray,
+        ends: np.ndarray,
+        *,
+        max_step_rad: float | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        starts = np.asarray(starts, dtype=np.float32).reshape(-1, 6)
+        ends = np.asarray(ends, dtype=np.float32).reshape(-1, 6)
+        if len(starts) != len(ends):
+            raise ValueError("starts and ends must contain the same number of segments")
+        if len(starts) == 0:
+            empty = np.zeros((0,), dtype=np.float32)
+            return empty, empty
+        max_step_rad = max(
+            1.0e-3,
+            float(
+                getattr(self, "planning_edge_step_rad", 0.10)
+                if max_step_rad is None
+                else max_step_rad
+            ),
+        )
+        max_deltas = np.max(np.abs(ends - starts), axis=1)
+        nsegs = np.maximum(1, np.ceil(max_deltas / max_step_rad).astype(np.int32))
         edges = []
         edge_ids = []
-        for edge_idx, (q_cand_n, nseg) in enumerate(zip(candidates_n, nsegs)):
+        endpoint_rows = []
+        row_offset = 0
+        for edge_idx, (q_start, q_end, nseg) in enumerate(zip(starts, ends, nsegs)):
             alpha = (np.arange(int(nseg) + 1, dtype=np.float32) / float(nseg))[:, None]
-            pts_n = q_cur_n[None, :] + alpha * (q_cand_n[None, :] - q_cur_n[None, :])
-            pts = np.asarray([self.kinematics.denormalize(row) for row in pts_n], dtype=np.float32)
+            pts = q_start[None, :] + alpha * (q_end[None, :] - q_start[None, :])
             edges.append(pts)
             edge_ids.extend([edge_idx] * len(pts))
-        if not edges:
-            return np.zeros((0,), dtype=np.float32)
+            endpoint_rows.append(row_offset + len(pts) - 1)
+            row_offset += len(pts)
         all_pts = np.vstack(edges).astype(np.float32)
         edge_t0 = time.perf_counter()
         all_clearances = checker.clearance_batch(all_pts)
         self._add_debug_ms("edge_check_ms", edge_t0)
         self._inc_debug("edge_check_calls", 1)
-        self._inc_debug("edge_check_edges", len(candidates_n))
+        self._inc_debug("edge_check_edges", len(starts))
         self._inc_debug("edge_check_states", len(all_pts))
-        out = np.full((len(candidates_n),), np.inf, dtype=np.float32)
+        out = np.full((len(starts),), np.inf, dtype=np.float32)
         for edge_idx, clearance in zip(edge_ids, all_clearances):
             out[int(edge_idx)] = min(float(out[int(edge_idx)]), float(clearance))
-        return out.astype(np.float32)
+        endpoint_clearances = np.asarray(all_clearances, dtype=np.float32)[np.asarray(endpoint_rows, dtype=np.int32)]
+        return out.astype(np.float32), endpoint_clearances.astype(np.float32)
 
     def _local_step_candidates(
         self,
@@ -2128,10 +2632,8 @@ class ArmFieldPlanner:
 
         final_n = rollouts_n[:, -1, :]
         q_goals = np.repeat(q_goal_n[None, :], sample_count, axis=0)
-        self._sync_model_device()
         tau_t0 = time.perf_counter()
         tau = np.asarray(self.field_model.predict_travel_times(final_n, q_goals), dtype=np.float32).reshape(-1)
-        self._sync_model_device()
         self._add_debug_ms("sampled_tau_infer_ms", tau_t0)
         self._inc_debug("sampled_tau_infer_calls", 1)
         self._inc_debug("sampled_tau_infer_pairs", sample_count)
@@ -2217,10 +2719,6 @@ class ArmFieldPlanner:
         if not isinstance(getattr(self, "last_debug", None), dict):
             return
         self.last_debug[key] = int(self.last_debug.get(key, 0)) + int(value)
-
-    def _sync_model_device(self) -> None:
-        if str(getattr(self.field_model, "device", "")).startswith("cuda") and torch.cuda.is_available():
-            torch.cuda.synchronize()
 
     def _valid_step_mask(
         self,

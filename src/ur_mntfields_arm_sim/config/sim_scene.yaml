@@ -85,8 +85,12 @@ arm_mntfields_explorer:
     visualization_frame: world
     ur_type: ur5
     output_dir: /home/mayank/ur_ws/src/ur5_sim_training_factorized_v9_v6_reverted
-    camera_in_tool: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.10, 0.0, 0.0, 0.0, 1.0]
-    voxel_size_m: 0.05
+    # Camera is above the wrist (tool -Y), with only 0.02 m forward offset.
+    camera_in_tool: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -0.08, 0.0, 0.0, 1.0, 0.02, 0.0, 0.0, 0.0, 1.0]
+    voxel_size_m: 0.02
+    # Drop unsynchronized frames instead of sweeping static surfaces through
+    # the accumulated map while the wrist is moving.
+    mapping_joint_sync_tolerance_s: 0.10
     frontier_match_radius_m: 0.18
     frontier_visit_radius_m: 0.20
     max_frontier_failures: 4
@@ -102,7 +106,7 @@ arm_mntfields_explorer:
     # point-cloud clearance remains active for execution validation/planning.
     sampling_clearance_backend: sdf
     nbv_clearance_backend: sdf
-    sdf_voxel_size_m: 0.04
+    sdf_voxel_size_m: 0.02
     sdf_padding_m: 0.75
     sdf_max_cells: 4000000
     # Reproduce the successful v6 balanced-shell distribution. Seven thousand
@@ -137,7 +141,7 @@ arm_mntfields_explorer:
     # batch enough times to reach a useful field inside ten minutes.
     train_epochs_per_step: 180
     train_every_n_frames: 1
-    replay_buffer_capacity: 200000
+    replay_buffer_capacity: 300000
     train_minibatch_size: 1024
     # Two 1024-row microbatches provide a 2048-row effective update without
     # holding the loss's second-derivative graph for all rows at once.
@@ -191,7 +195,7 @@ arm_mntfields_explorer:
     # Paper Eq. 12 only. Auxiliary log-speed, directional-normal, risk
     # reweighting, and synthetic zero-speed barrier objectives created a
     # second solution mode with nearly infinite gradients (predicted speed 0).
-    field_td_loss_weight: 0.0
+    field_td_loss_weight: 0.01
     field_speed_loss_weight: 0.01
     field_log_speed_loss_weight: 0.0
     field_direct_speed_loss_weight: 0.0
@@ -202,25 +206,20 @@ arm_mntfields_explorer:
     field_low_speed_pred_max: 0.30
     field_low_speed_penalty_weight: 0.0
     field_effective_speed_floor: 0.10
-    field_diag_gate_enabled: true
-    field_diag_gate_min_replay_pairs: 12000
-    field_diag_max_low_overpred_frac: 0.45
-    field_diag_min_speed_corr: 0.35
-    field_diag_min_near_far_gap: 0.20
-    field_diag_min_normal_cos_near: 0.20
-    # Replay-fit plots cannot expose unsampled false-free pockets. Before a
-    # checkpoint may become weights_final.pt, label fresh full-C-space states
-    # with the exact checker and hard-mine any obstacle state predicted free.
-    # This post-v6 certification/mining gate remains available for experiments.
-    # Disable it for a faithful v6-policy reproduction; fixed-goal evaluation
-    # and replay diagnostics still gate completion as they did in v6.
-    field_false_free_audit_enabled: false
-    field_false_free_audit_samples: 1024
+    state_readiness_gate_enabled: true
+    state_readiness_min_replay_states: 12000
+    state_readiness_min_free_states: 256
+    state_readiness_min_free_recall: 0.60
+    state_readiness_max_false_free_rate: 0.02
+    # Held-out exact labels remain independent of replay readiness and feed
+    # both false-free and false-blocked hard mining.
+    field_false_free_audit_enabled: true
+    field_false_free_audit_samples: 4096
     field_false_free_audit_goals_per_state: 4
     field_false_free_target_speed_max: 0.20
     field_false_free_pred_speed_min: 0.20
-    field_false_free_max_rate: 0.05
-    field_false_free_min_low_states: 32
+    field_false_free_max_rate: 0.02
+    field_false_free_min_low_states: 1000
     debug_point_cloud_topic: /debug/points/world
     planned_path_topic: /ur_mntfields_arm/planned_path
     replan_while_executing: false
@@ -304,7 +303,20 @@ arm_mntfields_explorer:
     # Certification intentionally evaluates a raw field rollout, while normal
     # exploration remains collision-aware until a newly trained field passes.
     field_eval_collision_aware_rollout: false
-    training_wall_time_limit_s: 600.0
+    training_wall_time_limit_s: 720.0
+    online_active_candidate_count: 65536
+    online_active_label_count: 2048
+    online_relabel_count: 8192
+    online_trajectory_problem_count: 64
+    online_certification_state_count: 8192
+    online_certification_route_count: 200
+    online_first_certification_s: 540.0
+    online_final_certification_s: 660.0
+    online_min_early_stop_s: 300.0
+    # True mapping-only bootstrap. Training starts only after this time and
+    # after ROI coverage reaches online_map_freeze_min_coverage.
+    online_map_freeze_s: 90.0
+    online_map_freeze_min_coverage: 0.90
     goal_tool_orientation_yaw_offsets_rad: [0.0, 1.5708, -1.5708, 3.1416]
     goal_tool_orientation_pitch_offsets_rad: [0.0, 0.7854, -0.7854, 1.5708, -1.5708]
     goal_tool_orientation_roll_offsets_rad: [0.0, 1.5708, -1.5708, 3.1416]

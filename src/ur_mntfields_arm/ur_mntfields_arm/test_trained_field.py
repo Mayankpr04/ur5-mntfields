@@ -19,9 +19,56 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from visualization_msgs.msg import Marker, MarkerArray
 
 from ur_mntfields_arm.arm_field_model import ArmFieldModel
-from ur_mntfields_arm.collision_checker import UR5PointCloudCollisionChecker, make_ur5_collision_checker
+from ur_mntfields_arm.budgeted_anchor_planner import BudgetedAnchorConfig, BudgetedFieldAnchorPlanner
+from ur_mntfields_arm.collision_checker import (
+    UR5PointCloudCollisionChecker,
+    make_ur5_collision_checker,
+    wrist_camera_collision_spheres,
+)
 from ur_mntfields_arm.planner import ArmFieldPlanner, JointSpaceRRTConnectPlanner
 from ur_mntfields_arm.ur5_kinematics import JOINT_NAMES, UR5Kinematics, look_at_rotation
+
+
+def _requires_certified_learned_checkpoint(planner_type: str) -> bool:
+    """Return whether a planner is allowed to execute without geometry checks."""
+    return str(planner_type).strip().lower() in {
+        "learned_speed",
+        "learned_speed_search",
+        "network_speed",
+        "network_only",
+        "field_anchor",
+        "network_anchor",
+        "budgeted_anchor",
+    }
+
+
+def _checkpoint_requires_certification(
+    planner_type: str, *, allow_uncertified_anchor_checkpoint: bool
+) -> bool:
+    planner = str(planner_type).strip().lower()
+    diagnostic_anchor = bool(allow_uncertified_anchor_checkpoint) and planner in {
+        "field_anchor", "network_anchor", "budgeted_anchor"
+    }
+    return _requires_certified_learned_checkpoint(planner) and not diagnostic_anchor
+
+
+class _LearnedSceneChecker:
+    """Scene-bounds carrier whose only state query is the learned v3 oracle."""
+
+    learned_only = True
+
+    def __init__(self, planner: ArmFieldPlanner, box_obstacles: np.ndarray, support_box_count: int):
+        self.planner = planner
+        self.box_obstacles = np.asarray(box_obstacles, dtype=np.float64).reshape(-1, 6)
+        self.support_box_count = int(support_box_count)
+        self.occupied_points = np.zeros((0, 3), dtype=np.float32)
+
+    def clearance_batch(self, q_batch: np.ndarray) -> np.ndarray:
+        return self.planner.learned_state_speeds(q_batch)
+
+    def clearance(self, q: np.ndarray) -> float:
+        values = self.clearance_batch(np.asarray(q, dtype=np.float64).reshape(1, 6))
+        return float(values[0]) if len(values) else 0.0
 
 
 def _rot_x(angle: float) -> np.ndarray:
@@ -74,7 +121,7 @@ class FieldPathTest(Node):
         self.declare_parameter("trajectory_topic", "/ur_mntfields_arm/test_joint_trajectory")
         self.declare_parameter("goal_marker_topic", "/ur_mntfields_arm/test_goal_markers")
         self.declare_parameter("startup_positions", [0.12, -2.3, 1.9, -2.5, -1.57, 0.0])
-        self.declare_parameter("camera_in_tool", [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.10, 0.0, 0.0, 0.0, 1.0])
+        self.declare_parameter("camera_in_tool", [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -0.08, 0.0, 0.0, 1.0, 0.02, 0.0, 0.0, 0.0, 1.0])
         self.declare_parameter("voxel_size_m", 0.05)
         self.declare_parameter("raycast_stride_px", 8)
         self.declare_parameter("depth_min_m", 0.20)
@@ -95,8 +142,15 @@ class FieldPathTest(Node):
         self.declare_parameter("rollout_max_steps", 120)
         self.declare_parameter("planner_mode", "bidirectional")
         self.declare_parameter("planner_type", "field_search")
+        self.declare_parameter("allow_uncertified_anchor_checkpoint", False)
         self.declare_parameter("planner_direct_edge", True)
         self.declare_parameter("planner_shortcut", True)
+        self.declare_parameter("budgeted_anchor_count", 1)
+        self.declare_parameter("budgeted_anchor_max_candidates", 8)
+        self.declare_parameter("budgeted_anchor_max_probes", 8)
+        self.declare_parameter("budgeted_anchor_clearance_min_m", 0.05)
+        self.declare_parameter("budgeted_anchor_sample_path", "")
+        self.declare_parameter("budgeted_anchor_force_first_goal", False)
         self.declare_parameter("rrt_step_size_q", 0.20)
         self.declare_parameter("rrt_max_iters", 4000)
         self.declare_parameter("rrt_goal_bias", 0.20)
@@ -109,10 +163,11 @@ class FieldPathTest(Node):
         # treats the intended collision label as free. Keep a real separation
         # between the label floor and an executable learned edge.
         self.declare_parameter("learned_speed_search_min_speed", 0.20)
-        self.declare_parameter("field_path_joint_edge_weight", 0.0)
+        self.declare_parameter("field_path_joint_edge_weight", 0.15)
+        self.declare_parameter("field_path_turn_weight", 0.25)
         self.declare_parameter("field_path_tool_edge_weight", 0.0)
         self.declare_parameter("field_path_tool_goal_weight", -1.0)
-        self.declare_parameter("field_path_clearance_penalty_weight", 0.0)
+        self.declare_parameter("field_path_clearance_penalty_weight", 20.0)
         self.declare_parameter("field_path_clearance_soft_margin_m", 0.04)
         self.declare_parameter("field_path_return_first_goal", True)
         self.declare_parameter("field_path_forward_probe_fraction", 0.15)
@@ -157,6 +212,7 @@ class FieldPathTest(Node):
         self.declare_parameter("field_precheck_neighborhood_samples", 16)
         self.declare_parameter("field_precheck_neighborhood_radius_norm", 0.015)
         self.declare_parameter("trajectory_max_joint_speed", 0.25)
+        self.declare_parameter("trajectory_max_joint_acceleration", 0.50)
         self.declare_parameter("trajectory_min_segment_dt", 0.35)
         self.declare_parameter("trajectory_waypoint_stride", 3)
         self.declare_parameter("trajectory_smoothing_window", 5)
@@ -183,6 +239,7 @@ class FieldPathTest(Node):
             [0.0] * 6,
             ParameterDescriptor(type=ParameterType.PARAMETER_DOUBLE_ARRAY),
         )
+        self.declare_parameter("fixed_goal_joint_positions_csv", "")
         self.declare_parameter("fixed_goal_points_frame", "world")
         self.declare_parameter("fixed_goal_points_xyz", [0.60, 0.35, 0.68, 0.60, 0.35, 1.12, 0.78, 0.35, 0.68])
         self.declare_parameter("fixed_goal_points_xyz_csv", "")
@@ -245,6 +302,18 @@ class FieldPathTest(Node):
         self.planner_type = str(self.get_parameter("planner_type").value).strip().lower()
         self.planner_direct_edge = bool(self.get_parameter("planner_direct_edge").value)
         self.planner_shortcut = bool(self.get_parameter("planner_shortcut").value)
+        self.budgeted_anchor_count = int(np.clip(int(self.get_parameter("budgeted_anchor_count").value), 1, 2))
+        self.budgeted_anchor_max_candidates = max(
+            2, int(self.get_parameter("budgeted_anchor_max_candidates").value)
+        )
+        self.budgeted_anchor_max_probes = max(1, int(self.get_parameter("budgeted_anchor_max_probes").value))
+        self.budgeted_anchor_clearance_min_m = max(
+            0.0, float(self.get_parameter("budgeted_anchor_clearance_min_m").value)
+        )
+        self.budgeted_anchor_sample_path = str(self.get_parameter("budgeted_anchor_sample_path").value).strip()
+        self.budgeted_anchor_force_first_goal = bool(
+            self.get_parameter("budgeted_anchor_force_first_goal").value
+        )
         self.rrt_step_size_q = max(0.01, float(self.get_parameter("rrt_step_size_q").value))
         self.rrt_max_iters = max(1, int(self.get_parameter("rrt_max_iters").value))
         self.rrt_goal_bias = float(np.clip(float(self.get_parameter("rrt_goal_bias").value), 0.0, 1.0))
@@ -261,6 +330,7 @@ class FieldPathTest(Node):
             np.clip(float(self.get_parameter("learned_speed_search_min_speed").value), 0.0, 1.0)
         )
         self.field_path_joint_edge_weight = float(self.get_parameter("field_path_joint_edge_weight").value)
+        self.field_path_turn_weight = float(self.get_parameter("field_path_turn_weight").value)
         self.field_path_tool_edge_weight = float(self.get_parameter("field_path_tool_edge_weight").value)
         configured_tool_goal_weight = float(self.get_parameter("field_path_tool_goal_weight").value)
         self.field_path_tool_goal_weight = None if configured_tool_goal_weight < 0.0 else configured_tool_goal_weight
@@ -335,6 +405,9 @@ class FieldPathTest(Node):
         self.field_precheck_neighborhood_samples = max(0, int(self.get_parameter("field_precheck_neighborhood_samples").value))
         self.field_precheck_neighborhood_radius_norm = max(0.0, float(self.get_parameter("field_precheck_neighborhood_radius_norm").value))
         self.trajectory_max_joint_speed = float(self.get_parameter("trajectory_max_joint_speed").value)
+        self.trajectory_max_joint_acceleration = float(
+            self.get_parameter("trajectory_max_joint_acceleration").value
+        )
         self.trajectory_min_segment_dt = float(self.get_parameter("trajectory_min_segment_dt").value)
         self.trajectory_waypoint_stride = int(self.get_parameter("trajectory_waypoint_stride").value)
         self.trajectory_smoothing_window = int(self.get_parameter("trajectory_smoothing_window").value)
@@ -348,7 +421,19 @@ class FieldPathTest(Node):
         self.fixed_goal_anchor_routing_enabled = bool(
             self.get_parameter("fixed_goal_anchor_routing_enabled").value
         )
-        fixed_goal_joints = [float(v) for v in self.get_parameter("fixed_goal_joint_positions").value]
+        fixed_goal_joints_csv = str(
+            self.get_parameter("fixed_goal_joint_positions_csv").value
+        ).strip()
+        if fixed_goal_joints_csv:
+            fixed_goal_joints = [
+                float(v.strip())
+                for v in fixed_goal_joints_csv.replace(";", ",").split(",")
+                if v.strip()
+            ]
+        else:
+            fixed_goal_joints = [
+                float(v) for v in self.get_parameter("fixed_goal_joint_positions").value
+            ]
         if len(fixed_goal_joints) % 6 != 0:
             raise ValueError(
                 f"fixed_goal_joint_positions must contain a multiple of 6 values, got {len(fixed_goal_joints)}"
@@ -431,11 +516,46 @@ class FieldPathTest(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.kinematics = UR5Kinematics(str(self.get_parameter("ur_type").value))
         self.field_model = ArmFieldModel(self.model_dir)
-        self.field_model.load_checkpoint(self._resolve_checkpoint())
+        self.learned_only_execution = _requires_certified_learned_checkpoint(self.planner_type)
+        anchor_mode = self.planner_type in {
+            "field_anchor", "network_anchor", "budgeted_anchor"
+        }
+        self.allow_uncertified_anchor_checkpoint = bool(
+            self.get_parameter("allow_uncertified_anchor_checkpoint").value
+        ) and anchor_mode
+        require_certified_checkpoint = _checkpoint_requires_certification(
+            self.planner_type,
+            allow_uncertified_anchor_checkpoint=self.allow_uncertified_anchor_checkpoint,
+        )
+        self.field_model.load_checkpoint(
+            self._resolve_checkpoint(), certified_execution=require_certified_checkpoint
+        )
+        if self.allow_uncertified_anchor_checkpoint and not self.field_model.certification_passed:
+            self.get_logger().warn(
+                "DIAGNOSTIC ONLY: field_anchor is loading an uncertified partial checkpoint. "
+                "No runtime geometric validation is enabled; do not use this mode on hardware."
+            )
         self.planner = ArmFieldPlanner(self.field_model, self.kinematics)
         self.rrt_planner = JointSpaceRRTConnectPlanner(self.kinematics)
+        self.budgeted_anchor_planner = BudgetedFieldAnchorPlanner(
+            self.planner,
+            self.kinematics,
+            BudgetedAnchorConfig(
+                anchor_budget=self.budgeted_anchor_count,
+                max_candidates=self.budgeted_anchor_max_candidates,
+                max_probes=self.budgeted_anchor_max_probes,
+                anchor_clearance_min_m=self.budgeted_anchor_clearance_min_m,
+                probe_clearance_min_m=self.trajectory_collision_margin_m,
+                learned_min_speed=self.learned_speed_search_min_speed,
+                planning_edge_step_rad=self.path_shortcut_interp_step_rad,
+                enforce_learned_safety=not self.allow_uncertified_anchor_checkpoint,
+            ),
+            camera_in_tool=self.camera_in_tool,
+        )
+        self.budgeted_anchors_initialized = False
         self.planner.set_score_weights(
             joint_edge=self.field_path_joint_edge_weight,
+            turn=self.field_path_turn_weight,
             tool_edge=self.field_path_tool_edge_weight,
             tool_goal=self.field_path_tool_goal_weight,
             clearance_penalty=self.field_path_clearance_penalty_weight,
@@ -461,6 +581,8 @@ class FieldPathTest(Node):
             f"rrt_edge_check_step_rad={self.rrt_edge_check_step_rad:.3f} "
             f"collision_aware_rollout={self.collision_aware_field_rollout} "
             f"collision_validation={self.trajectory_collision_validation_enabled} "
+            f"anchor_budget={self.budgeted_anchor_count} "
+            f"anchor_force_first_goal={self.budgeted_anchor_force_first_goal} "
             f"step_size_q={self.step_size_q:.4f} rollout_max_steps={self.rollout_max_steps} "
             f"collision_margin_m={self.trajectory_collision_margin_m:.4f} "
             f"path_joint_w={self.field_path_joint_edge_weight:.3f} "
@@ -479,7 +601,9 @@ class FieldPathTest(Node):
             f"cart_joint_w={self.cartesian_shortcut_joint_weight:.3f}"
         )
         self.robot_self_filter_checker = UR5PointCloudCollisionChecker(
-            self.kinematics, np.zeros((0, 3), dtype=np.float32)
+            self.kinematics,
+            np.zeros((0, 3), dtype=np.float32),
+            attached_spheres_local=wrist_camera_collision_spheres(self.camera_in_tool),
         )
 
         self.latest_info: CameraInfo | None = None
@@ -818,7 +942,16 @@ class FieldPathTest(Node):
             sdf_voxel_size_m=self.sdf_voxel_size_m,
             sdf_padding_m=self.sdf_padding_m,
             sdf_max_cells=self.sdf_max_cells,
+            attached_spheres_local=wrist_camera_collision_spheres(self.camera_in_tool),
         )
+
+    def _make_learned_scene_checker(self) -> _LearnedSceneChecker:
+        scene_boxes = self._scene_boxes_in_base()
+        support_boxes = self._support_boxes_in_base()
+        boxes = np.concatenate((scene_boxes, support_boxes), axis=0) if len(scene_boxes) and len(support_boxes) else (
+            scene_boxes if len(scene_boxes) else support_boxes
+        )
+        return _LearnedSceneChecker(self.planner, boxes, len(support_boxes))
 
     def _depth_to_world(self, depth: np.ndarray, info: CameraInfo, camera_pose: np.ndarray) -> np.ndarray:
         fx, fy = float(info.k[0]), float(info.k[4])
@@ -1292,19 +1425,46 @@ class FieldPathTest(Node):
         q_goal: np.ndarray,
     ) -> bool:
         """Check a shortcut using only dense learned-speed inference."""
+        return bool(self._field_safe_shortcut_targets(qa, np.asarray(qb, dtype=np.float64)[None, :], q_goal)[0])
+
+    def _field_safe_shortcut_targets(
+        self,
+        qa: np.ndarray,
+        targets: np.ndarray,
+        q_goal: np.ndarray,
+    ) -> np.ndarray:
+        """Evaluate multiple dense shortcut segments in one neural batch."""
+
         qa = np.asarray(qa, dtype=np.float64).reshape(6)
-        qb = np.asarray(qb, dtype=np.float64).reshape(6)
+        targets = np.asarray(targets, dtype=np.float64).reshape(-1, 6)
+        if len(targets) == 0:
+            return np.zeros((0,), dtype=bool)
         q_goal_n = self.kinematics.normalize(np.asarray(q_goal, dtype=np.float64)).astype(np.float32)
         max_step = max(0.01, self.path_shortcut_interp_step_rad)
-        count = max(1, int(np.ceil(float(np.max(np.abs(qb - qa))) / max_step)))
-        q = np.linspace(qa, qb, count + 1, dtype=np.float64)
-        qn = np.asarray([self.kinematics.normalize(row) for row in q], dtype=np.float32)
-        goals = np.repeat(q_goal_n[None, :], len(qn), axis=0)
-        pred, _ = self.field_model.predict_normalized_pair_speeds(qn, goals, batch_size=2048)
-        return bool(
-            len(pred) == len(qn)
-            and np.all(np.isfinite(pred))
-            and float(np.min(pred)) >= self.learned_speed_search_min_speed
+        rows: list[np.ndarray] = []
+        spans: list[tuple[int, int]] = []
+        cursor = 0
+        for qb in targets:
+            count = max(1, int(np.ceil(float(np.max(np.abs(qb - qa))) / max_step)))
+            q = np.linspace(qa, qb, count + 1, dtype=np.float64)
+            rows.append(np.asarray([self.kinematics.normalize(row) for row in q], dtype=np.float32))
+            spans.append((cursor, cursor + len(q)))
+            cursor += len(q)
+        qn = np.concatenate(rows, axis=0)
+        if hasattr(self.field_model, "predict_normalized_state_geometry"):
+            physical = np.asarray(
+                [self.kinematics.denormalize(row) for row in qn], dtype=np.float64
+            )
+            pred = self.planner.learned_state_speeds(physical, q_goal)
+        else:
+            goals = np.repeat(q_goal_n[None, :], len(qn), axis=0)
+            pred, _ = self.field_model.predict_normalized_pair_speeds(qn, goals, batch_size=2048)
+        if len(pred) != len(qn):
+            return np.zeros((len(targets),), dtype=bool)
+        threshold = float(self.learned_speed_search_min_speed)
+        return np.asarray(
+            [np.all(np.isfinite(pred[begin:end])) and float(np.min(pred[begin:end])) >= threshold for begin, end in spans],
+            dtype=bool,
         )
 
     def _shortcut_plan_field_only(self, plan: np.ndarray, q_goal: np.ndarray) -> np.ndarray:
@@ -1321,10 +1481,15 @@ class FieldPathTest(Node):
             changed = False
             while idx < len(cur) - 1:
                 next_idx = idx + 1
-                for candidate_idx in range(len(cur) - 1, idx, -1):
-                    if self._segment_field_safe(cur[idx], cur[candidate_idx], q_goal):
-                        next_idx = candidate_idx
-                        break
+                farthest_idx = len(cur) - 1
+                if self._segment_field_safe(cur[idx], cur[farthest_idx], q_goal):
+                    next_idx = farthest_idx
+                elif farthest_idx > idx + 1:
+                    candidate_indices = np.arange(idx + 1, farthest_idx, dtype=np.int32)
+                    safe = self._field_safe_shortcut_targets(cur[idx], cur[candidate_indices], q_goal)
+                    safe_indices = candidate_indices[safe]
+                    if len(safe_indices):
+                        next_idx = int(safe_indices[-1])
                 changed = changed or next_idx > idx + 1
                 shortcut.append(cur[next_idx].copy())
                 idx = next_idx
@@ -1332,6 +1497,70 @@ class FieldPathTest(Node):
             if not changed:
                 break
         return cur.astype(np.float32)
+
+    def _shortcut_plan_preserving_budgeted_anchors(
+        self,
+        checker: UR5PointCloudCollisionChecker,
+        plan: np.ndarray,
+        q_goal: np.ndarray,
+        planner_debug: dict[str, object],
+        geometric: bool,
+    ) -> np.ndarray:
+        """Shortcut each mandatory anchor leg without removing the anchor."""
+
+        pts = np.asarray(plan, dtype=np.float64).reshape(-1, 6)
+        if len(pts) <= 2 or not bool(planner_debug.get("used_anchor", False)):
+            return (
+                self._shortcut_plan(checker, pts)
+                if geometric
+                else self._shortcut_plan_field_only(pts, q_goal)
+            )
+        route_name = str(planner_debug.get("selected_route", ""))
+        route_indices: list[int] = []
+        if route_name.startswith("anchor_"):
+            for token in route_name.removeprefix("anchor_").split("_"):
+                if token.isdigit():
+                    route_indices.append(int(token) - 1)
+        anchors = np.asarray(self.budgeted_anchor_planner.anchors, dtype=np.float64).reshape(-1, 6)
+        required = [anchors[idx] for idx in route_indices if 0 <= idx < len(anchors)]
+        if not required:
+            return pts.astype(np.float32)
+
+        split_indices: list[int] = []
+        begin = 0
+        for anchor in required:
+            distances = np.linalg.norm(pts[begin:] - anchor[None, :], axis=1)
+            relative = int(np.argmin(distances))
+            index = begin + relative
+            if float(distances[relative]) > 1.0e-3 or index <= begin or index >= len(pts) - 1:
+                self.get_logger().warn(
+                    "Could not locate a mandatory budgeted anchor exactly in the raw path; "
+                    "leaving the anchored path unshortened."
+                )
+                return pts.astype(np.float32)
+            split_indices.append(index)
+            begin = index
+
+        output: list[np.ndarray] = []
+        begin = 0
+        segment_goals = required + [np.asarray(q_goal, dtype=np.float64)]
+        for end, segment_goal in zip(split_indices + [len(pts) - 1], segment_goals):
+            segment = pts[begin : end + 1]
+            shortened = (
+                self._shortcut_plan(checker, segment)
+                if geometric
+                else self._shortcut_plan_field_only(segment, segment_goal)
+            )
+            if len(shortened) == 0:
+                return pts.astype(np.float32)
+            output.extend(shortened if not output else shortened[1:])
+            begin = end
+        result = np.asarray(output, dtype=np.float32)
+        self.get_logger().info(
+            "Preserved mandatory anchor(s) during shortcutting: "
+            f"route={route_name} raw_waypoints={len(pts)} shortened_waypoints={len(result)}"
+        )
+        return result
 
     def _plan_length(self, plan: np.ndarray) -> float:
         pts = np.asarray(plan, dtype=np.float64)
@@ -1479,11 +1708,18 @@ class FieldPathTest(Node):
     def _field_candidate_precheck(self, q_start: np.ndarray, q_goal: np.ndarray) -> dict[str, float | bool]:
         if not self.field_precheck_enabled:
             return {"ok": True, "field_speed_start": -1.0, "field_speed_goal": -1.0, "field_goal_nbhd_mean": -1.0, "field_goal_nbhd_min": -1.0}
-        q0n = self.kinematics.normalize(np.asarray(q_start, dtype=np.float64)).astype(np.float32)
-        q1n = self.kinematics.normalize(np.asarray(q_goal, dtype=np.float64)).astype(np.float32)
-        pred0, pred1 = self.field_model.predict_normalized_pair_speeds(q0n, q1n)
-        speed0 = float(pred0[0]) if len(pred0) else float("nan")
-        speed1 = float(pred1[0]) if len(pred1) else float("nan")
+        q_start = np.asarray(q_start, dtype=np.float64)
+        q_goal = np.asarray(q_goal, dtype=np.float64)
+        q0n = self.kinematics.normalize(q_start).astype(np.float32)
+        q1n = self.kinematics.normalize(q_goal).astype(np.float32)
+        if hasattr(self.field_model, "predict_normalized_state_geometry"):
+            endpoint_speed = self.planner.learned_state_speeds(np.asarray([q_start, q_goal]))
+            speed0 = float(endpoint_speed[0]) if len(endpoint_speed) > 0 else float("nan")
+            speed1 = float(endpoint_speed[1]) if len(endpoint_speed) > 1 else float("nan")
+        else:
+            pred0, pred1 = self.field_model.predict_normalized_pair_speeds(q0n, q1n)
+            speed0 = float(pred0[0]) if len(pred0) else float("nan")
+            speed1 = float(pred1[0]) if len(pred1) else float("nan")
         nbhd_mean = speed1
         nbhd_min = speed1
         if self.field_precheck_neighborhood_samples > 0 and self.field_precheck_neighborhood_radius_norm > 0.0:
@@ -1496,8 +1732,14 @@ class FieldPathTest(Node):
                 radius = float(self.rng.uniform(0.0, self.field_precheck_neighborhood_radius_norm))
                 samples.append(np.clip(q1n + direction.astype(np.float32) * radius, -0.5, 0.5))
             q1_samples = np.asarray(samples, dtype=np.float32)
-            q0_samples = np.repeat(q0n[None, :], len(q1_samples), axis=0)
-            _p0, p1 = self.field_model.predict_normalized_pair_speeds(q0_samples, q1_samples)
+            if hasattr(self.field_model, "predict_normalized_state_geometry"):
+                physical_samples = np.asarray(
+                    [self.kinematics.denormalize(row) for row in q1_samples], dtype=np.float64
+                )
+                p1 = self.planner.learned_state_speeds(physical_samples)
+            else:
+                q0_samples = np.repeat(q0n[None, :], len(q1_samples), axis=0)
+                _p0, p1 = self.field_model.predict_normalized_pair_speeds(q0_samples, q1_samples)
             finite = p1[np.isfinite(p1)]
             if len(finite):
                 nbhd_mean = float(np.mean(finite))
@@ -1520,6 +1762,11 @@ class FieldPathTest(Node):
     def _field_speed_at_waypoint(self, q_waypoint: np.ndarray | None, q_goal: np.ndarray) -> float:
         if q_waypoint is None:
             return -1.0
+        if hasattr(self.field_model, "predict_normalized_state_geometry"):
+            speed = self.planner.learned_state_speeds(
+                np.asarray(q_waypoint, dtype=np.float64).reshape(1, 6)
+            )
+            return float(speed[0]) if len(speed) and np.isfinite(speed[0]) else -1.0
         q0n = self.kinematics.normalize(np.asarray(q_waypoint, dtype=np.float64)).astype(np.float32)
         q1n = self.kinematics.normalize(np.asarray(q_goal, dtype=np.float64)).astype(np.float32)
         pred0, _pred1 = self.field_model.predict_normalized_pair_speeds(q0n, q1n)
@@ -1781,6 +2028,22 @@ class FieldPathTest(Node):
                 clearance_margin_m=self.trajectory_collision_margin_m,
                 edge_check_step_rad=self.rrt_edge_check_step_rad,
             )
+        if self.planner_type in ("field_anchor", "network_anchor", "budgeted_anchor"):
+            if not self._ensure_budgeted_anchors(checker):
+                self.get_logger().warn(
+                    "Budgeted anchor selection returned no useful anchors; running the direct field planner."
+                )
+            return self.budgeted_anchor_planner.plan(
+                q_start,
+                q_goal,
+                step_size_q=self.step_size_q,
+                max_steps=self.rollout_max_steps,
+                force_anchor=(
+                    self.budgeted_anchor_force_first_goal
+                    and self.fixed_goal_sequence_enabled
+                    and self.fixed_goal_index == 0
+                ),
+            )
         if not self.collision_aware_field_rollout:
             if self.planner_type in (
                 "learned_speed_search",
@@ -1805,7 +2068,16 @@ class FieldPathTest(Node):
                     "Refusing to silently substitute a different planner."
                 )
                 return np.zeros((0, 6), dtype=np.float32)
-            return self.planner.plan(q_start, q_goal, self.step_size_q, self.rollout_max_steps, mode=self.planner_mode)
+            return self.planner.plan(
+                q_start,
+                q_goal,
+                self.step_size_q,
+                self.rollout_max_steps,
+                mode=self.planner_mode,
+                allow_direct_edge=self.planner_direct_edge,
+                min_predicted_speed=self.learned_speed_search_min_speed,
+                edge_check_step_rad=self.path_shortcut_interp_step_rad,
+            )
         if self.planner_type in ("sampled", "sampled_rollout", "mppi"):
             return self.planner.plan_sampled_rollout(
                 checker,
@@ -1861,23 +2133,142 @@ class FieldPathTest(Node):
             mode=self.planner_mode,
         )
 
+    def _budgeted_anchor_sample_rows(self) -> np.ndarray:
+        if self.budgeted_anchor_sample_path:
+            path = Path(self.budgeted_anchor_sample_path)
+        else:
+            checkpoint = self._resolve_checkpoint()
+            checkpoint_samples = sorted(checkpoint.parent.parent.joinpath("samples").glob("step_*.npz"))
+            path = checkpoint_samples[-1] if checkpoint_samples else self._resolve_sample_file()
+        payload = np.load(path)
+        if "frame_data" not in payload:
+            raise KeyError(f"{path} does not contain frame_data for anchor selection")
+        frame = np.asarray(payload["frame_data"], dtype=np.float32)
+        if frame.ndim != 2 or len(frame) == 0:
+            raise ValueError(f"{path} frame_data is empty")
+        if frame.shape[1] == 13:
+            normalized = frame[:, :6]
+        elif frame.shape[1] == 26:
+            normalized = np.vstack((frame[:, :6], frame[:, 6:12]))
+        else:
+            raise ValueError(f"Unsupported frame_data width for anchor selection: {frame.shape}")
+        rows = np.asarray([self.kinematics.denormalize(qn) for qn in normalized], dtype=np.float64)
+        rows = np.vstack((rows, self.startup_positions.reshape(1, 6), self.fixed_goal_joint_positions))
+        return rows
+
+    def _ensure_budgeted_anchors(self, checker: UR5PointCloudCollisionChecker) -> bool:
+        if self.budgeted_anchors_initialized:
+            return bool(len(self.budgeted_anchor_planner.anchors))
+        self.get_logger().info(
+            "Starting one-time budgeted anchor selection; this initialization is not trajectory execution time."
+        )
+        try:
+            rows = self._budgeted_anchor_sample_rows()
+        except (OSError, KeyError, ValueError) as exc:
+            self.get_logger().warn(
+                f"Could not load replay configurations for anchor selection ({exc}); using deterministic joint samples."
+            )
+            rng = np.random.default_rng(17)
+            rows = rng.uniform(
+                self.kinematics.joint_min,
+                self.kinematics.joint_max,
+                size=(2048, 6),
+            ).astype(np.float64)
+            rows = np.vstack((rows, self.startup_positions.reshape(1, 6), self.fixed_goal_joint_positions))
+        selection_checker = checker
+        selection_backend = "live_scene"
+        if len(checker.box_obstacles) and (
+            not bool(getattr(checker, "learned_only", False))
+            or self.allow_uncertified_anchor_checkpoint
+        ):
+            # The anchor is defined by the trusted/observed bounding boxes.
+            # Do not let a view-dependent depth cloud make this one-time global
+            # workspace construction appear or disappear between runs.
+            selection_checker = UR5PointCloudCollisionChecker(
+                self.kinematics,
+                np.zeros((0, 3), dtype=np.float32),
+                box_obstacles=np.asarray(checker.box_obstacles, dtype=np.float64),
+                support_box_count=int(checker.support_box_count),
+                attached_spheres_local=wrist_camera_collision_spheres(self.camera_in_tool),
+            )
+            selection_backend = "scene_boxes"
+        anchors = self.budgeted_anchor_planner.select_anchors(
+            selection_checker,
+            rows,
+            self.startup_positions.reshape(1, 6),
+        )
+        self.budgeted_anchors_initialized = True
+        debug = dict(self.budgeted_anchor_planner.last_debug)
+        debug["selection_backend"] = selection_backend
+        self.get_logger().info(
+            "Budgeted field-anchor selection complete: "
+            f"selected={len(anchors)}/{self.budgeted_anchor_count} "
+            f"anchors={np.round(anchors, 3).tolist()} debug={debug}"
+        )
+        self._publish_budgeted_anchor_markers(anchors)
+        return bool(len(anchors))
+
+    def _publish_budgeted_anchor_markers(self, anchors: np.ndarray) -> None:
+        rows = np.asarray(anchors, dtype=np.float64).reshape(-1, 6)
+        if not len(rows):
+            return
+        frame_id = self.visualization_frame if self.visualization_frame else self.base_frame
+        arr = MarkerArray()
+        camera_points: list[list[float]] = []
+        for idx, q_anchor in enumerate(rows):
+            tool_pose = self.kinematics.fk(q_anchor)
+            camera_pose = self.kinematics.tool_to_camera_pose(tool_pose, self.camera_in_tool)
+            camera_base = np.asarray(camera_pose[:3, 3], dtype=np.float64)
+            vis = self._transform_point_for_visualization(camera_base)
+            marker = Marker()
+            marker.header = Header(frame_id=frame_id)
+            marker.ns = "field_test_budgeted_anchors"
+            marker.id = idx
+            marker.type = Marker.SPHERE
+            marker.action = Marker.ADD
+            marker.scale.x = 0.11
+            marker.scale.y = 0.11
+            marker.scale.z = 0.11
+            marker.color.r = 0.10
+            marker.color.g = 0.95 if idx == 0 else 0.55
+            marker.color.b = 0.95 if idx == 0 else 1.00
+            marker.color.a = 0.98
+            marker.pose.position.x = float(vis[0])
+            marker.pose.position.y = float(vis[1])
+            marker.pose.position.z = float(vis[2])
+            marker.pose.orientation.w = 1.0
+            arr.markers.append(marker)
+            camera_points.append(np.round(camera_base, 3).tolist())
+        self.goal_marker_pub.publish(arr)
+        self.get_logger().info(
+            f"Published {len(arr.markers)} automatic anchor marker(s) on {self.goal_marker_topic} "
+            f"(ns=field_test_budgeted_anchors, camera_base_xyz={camera_points})."
+        )
+
     def _run_to_joint_goal(self, q_goal: np.ndarray) -> np.ndarray | None:
-        if self.latest_depth is None or self.latest_info is None:
+        if not self.learned_only_execution and (self.latest_depth is None or self.latest_info is None):
             return None
         if self.current_joints is None:
             self.get_logger().warn("Cannot plan to fixed joint goal because no joint state has been received yet.")
             return None
-        if self.latest_camera_pose is None:
+        if not self.learned_only_execution and self.latest_camera_pose is None:
             self.get_logger().warn("Cannot plan to fixed joint goal because no camera pose is available yet.")
             return None
         q_start = np.asarray(self.current_joints, dtype=np.float64).copy()
         q_goal = self.kinematics.clamp(np.asarray(q_goal, dtype=np.float64).reshape(6))
-        points_world, raw_point_count, self_removed, used_cached_cloud = self._current_collision_points(
-            q_start, "fixed joint goal planning"
-        )
-        if points_world is None:
-            return None
-        checker = self._make_collision_checker(points_world)
+        if self.learned_only_execution:
+            points_world = np.zeros((0, 3), dtype=np.float32)
+            raw_point_count = 0
+            self_removed = 0
+            used_cached_cloud = False
+            checker = self._make_learned_scene_checker()
+        else:
+            points_world, raw_point_count, self_removed, used_cached_cloud = self._current_collision_points(
+                q_start, "fixed joint goal planning"
+            )
+            if points_world is None:
+                return None
+            checker = self._make_collision_checker(points_world)
         goal_clearance = (
             float(checker.clearance(q_goal))
             if self.trajectory_collision_validation_enabled or self.collision_aware_field_rollout
@@ -1896,11 +2287,12 @@ class FieldPathTest(Node):
         plan_t0 = time.perf_counter()
         raw_plan = self._plan_field_path(checker, q_start, q_goal)
         plan_ms = (time.perf_counter() - plan_t0) * 1e3
-        debug_planner = (
-            self.rrt_planner
-            if self.planner_type in ("rrt", "rrt_connect", "rrtconnect")
-            else self.planner
-        )
+        if self.planner_type in ("rrt", "rrt_connect", "rrtconnect"):
+            debug_planner = self.rrt_planner
+        elif self.planner_type in ("field_anchor", "network_anchor", "budgeted_anchor"):
+            debug_planner = self.budgeted_anchor_planner
+        else:
+            debug_planner = self.planner
         planner_debug = dict(getattr(debug_planner, "last_debug", {}))
         used_direct_fallback = False
         if np.asarray(raw_plan).ndim != 2 or len(raw_plan) == 0:
@@ -1918,12 +2310,28 @@ class FieldPathTest(Node):
             )
             raw_plan = self._direct_joint_plan(q_start, q_goal)
         validate_t0 = time.perf_counter()
+        shortcut_t0 = time.perf_counter()
         if self.trajectory_collision_validation_enabled:
-            plan = self._shortcut_plan(checker, raw_plan)
+            if self.planner_type in ("field_anchor", "network_anchor", "budgeted_anchor"):
+                plan = self._shortcut_plan_preserving_budgeted_anchors(
+                    checker, raw_plan, q_goal, planner_debug, geometric=True
+                )
+            else:
+                plan = self._shortcut_plan(checker, raw_plan)
+            shortcut_ms = (time.perf_counter() - shortcut_t0) * 1e3
+            collision_validate_t0 = time.perf_counter()
             path_ok, min_clearance = self._validate_plan_collision(checker, plan)
+            collision_validate_ms = (time.perf_counter() - collision_validate_t0) * 1e3
             min_q_field_speed = self._field_speed_at_waypoint(self.last_validation_min_q, q_goal)
         else:
-            plan = self._shortcut_plan_field_only(raw_plan, q_goal)
+            if self.planner_type in ("field_anchor", "network_anchor", "budgeted_anchor"):
+                plan = self._shortcut_plan_preserving_budgeted_anchors(
+                    checker, raw_plan, q_goal, planner_debug, geometric=False
+                )
+            else:
+                plan = self._shortcut_plan_field_only(raw_plan, q_goal)
+            shortcut_ms = (time.perf_counter() - shortcut_t0) * 1e3
+            collision_validate_ms = 0.0
             path_ok = True
             min_clearance = float("nan")
             self.last_validation_min_idx = -1
@@ -1945,7 +2353,8 @@ class FieldPathTest(Node):
             f"used_cached_cloud={used_cached_cloud} collision_points={len(points_world)} "
             f"collision_validation_enabled={self.trajectory_collision_validation_enabled} "
             f"used_direct_fallback={used_direct_fallback} planner_debug={planner_debug} "
-            f"plan_ms={plan_ms:.1f} validate_ms={validate_ms:.1f}"
+            f"plan_ms={plan_ms:.1f} shortcut_ms={shortcut_ms:.1f} "
+            f"collision_validate_ms={collision_validate_ms:.1f} validate_ms={validate_ms:.1f}"
         )
         self._publish_goal_markers(q_start, q_goal, self.kinematics.fk(q_goal)[:3, 3])
         self._publish_planned_path(plan)
@@ -2207,6 +2616,28 @@ class FieldPathTest(Node):
         if len(exec_plan) == 0:
             self.get_logger().warn("Skipping field test trajectory publish because execution plan is empty.")
             return False
+        if self.learned_only_execution and not self.allow_uncertified_anchor_checkpoint:
+            dense_exec = self._dense_plan_points(exec_plan)
+            if len(dense_exec) == 0:
+                dense_exec = np.asarray(exec_plan, dtype=np.float64)
+            learned_speed = self.planner.learned_state_speeds(dense_exec)
+            threshold = float(self.learned_speed_search_min_speed)
+            if (
+                len(learned_speed) != len(dense_exec)
+                or not np.all(np.isfinite(learned_speed))
+                or float(np.min(learned_speed)) < threshold
+            ):
+                min_speed = (
+                    float(np.nanmin(learned_speed))
+                    if len(learned_speed) and np.any(np.isfinite(learned_speed))
+                    else float("nan")
+                )
+                self.get_logger().warn(
+                    "Skipping learned-only trajectory because execution interpolation failed the "
+                    f"certified state/coverage oracle: min_speed={min_speed:.4f} "
+                    f"required_speed={threshold:.4f}."
+                )
+                return False
         if self.trajectory_collision_validation_enabled and checker is not None:
             exec_ok, exec_min_clearance = self._validate_plan_collision(checker, exec_plan)
             if not exec_ok:
@@ -2216,39 +2647,67 @@ class FieldPathTest(Node):
                     f"required_margin_m={self.trajectory_collision_margin_m:.4f}."
                 )
                 return False
+        points = np.asarray(exec_plan, dtype=np.float64)
+        if current_q is not None and (len(points) == 0 or np.max(np.abs(points[0] - current_q)) >= 1.0e-4):
+            points = np.vstack((current_q, points))
+        if len(points) > 1:
+            keep = np.concatenate(([True], np.max(np.abs(np.diff(points, axis=0)), axis=1) >= 1.0e-4))
+            points = points[keep]
+        times, velocities, accelerations = self._time_parameterize_joint_path(points, start_delay_s=0.5)
         msg = JointTrajectory()
         msg.header = Header(frame_id=self.base_frame)
         msg.joint_names = JOINT_NAMES
-        t_cur = 0.5
-        if current_q is not None:
-            pt = JointTrajectoryPoint()
-            pt.positions = [float(v) for v in current_q]
-            pt.time_from_start.sec = int(t_cur)
-            pt.time_from_start.nanosec = int((t_cur - int(t_cur)) * 1e9)
-            msg.points.append(pt)
-        prev_q = current_q
-        max_joint_speed = max(1e-3, self.trajectory_max_joint_speed)
-        segment_dt_floor = 0.02
-        for q in exec_plan:
-            if prev_q is not None and np.max(np.abs(q - prev_q)) < 1e-4:
-                continue
-            if prev_q is None:
-                dt = 0.5
-            else:
-                max_delta = float(np.max(np.abs(q - prev_q)))
-                dt = max(segment_dt_floor, max_delta / max_joint_speed)
-            t_cur += dt
+        for idx, q in enumerate(points):
             pt = JointTrajectoryPoint()
             pt.positions = [float(v) for v in q]
+            pt.velocities = [float(v) for v in velocities[idx]]
+            pt.accelerations = [float(v) for v in accelerations[idx]]
+            t_cur = float(times[idx])
             pt.time_from_start.sec = int(t_cur)
             pt.time_from_start.nanosec = int((t_cur - int(t_cur)) * 1e9)
             msg.points.append(pt)
-            prev_q = q
+        t_cur = float(times[-1]) if len(times) else 0.0
         self.get_logger().info(
-            f"Publishing field test trajectory: exec_waypoints={len(msg.points)} estimated_duration_s={t_cur:.1f}"
+            f"Publishing field test trajectory: exec_waypoints={len(msg.points)} estimated_duration_s={t_cur:.1f} "
+            f"max_speed={self.trajectory_max_joint_speed:.2f} "
+            f"max_acceleration={self.trajectory_max_joint_acceleration:.2f}"
         )
         self.trajectory_pub.publish(msg)
         return True
+
+    def _time_parameterize_joint_path(
+        self,
+        points: np.ndarray,
+        *,
+        start_delay_s: float = 0.5,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Assign continuous waypoint derivatives under speed/acceleration bounds."""
+        q = np.asarray(points, dtype=np.float64).reshape(-1, 6)
+        n = len(q)
+        if n == 0:
+            empty = np.zeros((0,), dtype=np.float64)
+            return empty, np.zeros((0, 6)), np.zeros((0, 6))
+        vmax = max(1.0e-3, float(self.trajectory_max_joint_speed))
+        amax = max(1.0e-3, float(self.trajectory_max_joint_acceleration))
+        times = np.full((n,), float(start_delay_s), dtype=np.float64)
+        if n > 1:
+            delta = np.abs(np.diff(q, axis=0))
+            dt_speed = np.max(delta, axis=1) / vmax
+            # Conservative triangular-profile lower bound for each segment.
+            dt_accel = 2.0 * np.sqrt(np.max(delta, axis=1) / amax)
+            dt = np.maximum.reduce((dt_speed, dt_accel, np.full(n - 1, 0.02)))
+            times[1:] += np.cumsum(dt)
+        velocities = np.zeros_like(q)
+        if n > 2:
+            span = np.maximum(times[2:] - times[:-2], 1.0e-6)
+            velocities[1:-1] = (q[2:] - q[:-2]) / span[:, None]
+            velocities[1:-1] = np.clip(velocities[1:-1], -vmax, vmax)
+        accelerations = np.zeros_like(q)
+        if n > 2:
+            dt_mid = np.maximum(0.5 * (times[2:] - times[:-2]), 1.0e-6)
+            accelerations[1:-1] = (velocities[2:] - velocities[:-2]) / (2.0 * dt_mid[:, None])
+            accelerations[1:-1] = np.clip(accelerations[1:-1], -amax, amax)
+        return times, velocities, accelerations
 
 
 def main():

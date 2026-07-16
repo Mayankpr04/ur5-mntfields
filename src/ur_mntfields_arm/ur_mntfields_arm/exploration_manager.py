@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+from collections import deque
 import json
 from pathlib import Path as FsPath
+import threading
 import time
 
 import cv2
 import numpy as np
 import rclpy
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from scipy.spatial import cKDTree
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Point
 from nav_msgs.msg import Path as NavPath
@@ -20,7 +25,11 @@ from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import PoseStamped
 
 from ur_mntfields_arm.arm_field_model import ArmFieldModel
-from ur_mntfields_arm.collision_checker import UR5PointCloudCollisionChecker, make_ur5_collision_checker
+from ur_mntfields_arm.collision_checker import (
+    UR5PointCloudCollisionChecker,
+    make_ur5_collision_checker,
+    wrist_camera_collision_spheres,
+)
 from ur_mntfields_arm.cspace_sampling import (
     make_cspace_pair_rows_from_q_pairs,
     sample_cspace_training_batch,
@@ -28,6 +37,19 @@ from ur_mntfields_arm.cspace_sampling import (
 )
 from ur_mntfields_arm.frontier_bank import FrontierBank
 from ur_mntfields_arm.goal_selector import ViewGoalSelector
+from ur_mntfields_arm.online_training import (
+    CertificationMetrics,
+    OnlineTrainingBudget,
+    SampleSource,
+    assign_clearance_sources,
+    checkpoint_scene_metadata,
+    derive_coverage_radius,
+    exact_label_states,
+    false_free_mask,
+    paired_shell_states,
+    scrambled_sobol_states,
+    select_active_candidates,
+)
 from ur_mntfields_arm.planner import ArmFieldPlanner, JointSpaceRRTConnectPlanner
 from ur_mntfields_arm.ur5_kinematics import JOINT_NAMES, UR5Kinematics, ViewGoal, _transform, look_at_rotation
 from ur_mntfields_arm.voxel_map import SparseVoxelMap
@@ -92,8 +114,10 @@ class ArmMNTFieldsExplorer(Node):
         self.declare_parameter("tool_frame", "tool0")
         self.declare_parameter("ur_type", "ur5")
         self.declare_parameter("output_dir", "/tmp/ur_mntfields_arm")
+        self.declare_parameter("require_fresh_output_dir", True)
         self.declare_parameter("camera_in_tool", [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0])
-        self.declare_parameter("voxel_size_m", 0.05)
+        self.declare_parameter("voxel_size_m", 0.02)
+        self.declare_parameter("mapping_joint_sync_tolerance_s", 0.10)
         self.declare_parameter("frontier_match_radius_m", 0.18)
         self.declare_parameter("frontier_visit_radius_m", 0.20)
         self.declare_parameter("max_frontier_failures", 4)
@@ -127,7 +151,7 @@ class ArmMNTFieldsExplorer(Node):
         self.declare_parameter("training_anchor_joint_goals", [0.0] * 6)
         self.declare_parameter("train_epochs_per_step", 5)
         self.declare_parameter("train_every_n_frames", 1)
-        self.declare_parameter("replay_buffer_capacity", 100000)
+        self.declare_parameter("replay_buffer_capacity", 300000)
         self.declare_parameter("train_minibatch_size", 2000)
         self.declare_parameter("train_gradient_accumulation_steps", 1)
         self.declare_parameter("train_replay_ratio", 0.75)
@@ -164,8 +188,8 @@ class ArmMNTFieldsExplorer(Node):
         self.declare_parameter("field_diagnostics_save_joint_slices", False)
         # Paper Eq. 12 is the default objective.  The TD, direct-speed and
         # normal losses are experimental auxiliaries and remain opt-in.
-        self.declare_parameter("field_td_loss_weight", 0.0)
-        self.declare_parameter("field_speed_loss_weight", 1.0)
+        self.declare_parameter("field_td_loss_weight", 0.01)
+        self.declare_parameter("field_speed_loss_weight", 0.01)
         self.declare_parameter("field_log_speed_loss_weight", 0.0)
         self.declare_parameter("field_direct_speed_loss_weight", 0.0)
         self.declare_parameter("field_normal_loss_weight", 0.0)
@@ -175,14 +199,13 @@ class ArmMNTFieldsExplorer(Node):
         self.declare_parameter("field_low_speed_pred_max", 0.30)
         self.declare_parameter("field_low_speed_penalty_weight", 0.0)
         self.declare_parameter("field_effective_speed_floor", 0.05)
-        self.declare_parameter("field_diag_gate_enabled", True)
-        self.declare_parameter("field_diag_gate_min_replay_pairs", 12000)
-        self.declare_parameter("field_diag_max_low_overpred_frac", 0.45)
-        self.declare_parameter("field_diag_min_speed_corr", 0.35)
-        self.declare_parameter("field_diag_min_near_far_gap", 0.20)
-        self.declare_parameter("field_diag_min_normal_cos_near", 0.20)
+        self.declare_parameter("state_readiness_gate_enabled", True)
+        self.declare_parameter("state_readiness_min_replay_states", 12000)
+        self.declare_parameter("state_readiness_min_free_states", 256)
+        self.declare_parameter("state_readiness_min_free_recall", 0.60)
+        self.declare_parameter("state_readiness_max_false_free_rate", 0.02)
         self.declare_parameter("field_false_free_audit_enabled", True)
-        self.declare_parameter("field_false_free_audit_samples", 1024)
+        self.declare_parameter("field_false_free_audit_samples", 4096)
         self.declare_parameter("field_false_free_audit_goals_per_state", 4)
         self.declare_parameter("field_false_free_target_speed_max", 0.20)
         self.declare_parameter("field_false_free_pred_speed_min", 0.20)
@@ -238,7 +261,18 @@ class ArmMNTFieldsExplorer(Node):
         self.declare_parameter("field_eval_min_replay_pairs", 30000)
         self.declare_parameter("field_eval_use_startup_pose", True)
         self.declare_parameter("field_eval_collision_aware_rollout", False)
-        self.declare_parameter("training_wall_time_limit_s", 600.0)
+        self.declare_parameter("training_wall_time_limit_s", 720.0)
+        self.declare_parameter("online_active_candidate_count", 65536)
+        self.declare_parameter("online_active_label_count", 2048)
+        self.declare_parameter("online_relabel_count", 2048)
+        self.declare_parameter("online_trajectory_problem_count", 64)
+        self.declare_parameter("online_certification_state_count", 8192)
+        self.declare_parameter("online_certification_route_count", 200)
+        self.declare_parameter("online_first_certification_s", 540.0)
+        self.declare_parameter("online_final_certification_s", 660.0)
+        self.declare_parameter("online_min_early_stop_s", 300.0)
+        self.declare_parameter("online_map_freeze_s", 90.0)
+        self.declare_parameter("online_map_freeze_min_coverage", 0.90)
         self.declare_parameter("goal_tool_orientation_yaw_offsets_rad", [0.0, 1.5708, -1.5708, 3.1416])
         self.declare_parameter("goal_tool_orientation_pitch_offsets_rad", [0.0, 0.7854, -0.7854, 1.5708, -1.5708])
         self.declare_parameter("goal_tool_orientation_roll_offsets_rad", [0.0, 1.5708, -1.5708, 3.1416])
@@ -288,6 +322,12 @@ class ArmMNTFieldsExplorer(Node):
         self.camera_frame = str(self.get_parameter("camera_frame").value)
         self.tool_frame = str(self.get_parameter("tool_frame").value)
         self.output_dir = FsPath(str(self.get_parameter("output_dir").value)).expanduser()
+        self.require_fresh_output_dir = bool(self.get_parameter("require_fresh_output_dir").value)
+        if self.require_fresh_output_dir and self.output_dir.exists() and any(self.output_dir.iterdir()):
+            raise RuntimeError(
+                f"Fresh online training requires an empty output_dir, but {self.output_dir} is not empty. "
+                "Choose a new output_dir; existing weights are never reused."
+            )
         try:
             self.output_dir.mkdir(parents=True, exist_ok=True)
         except PermissionError as exc:
@@ -422,12 +462,19 @@ class ArmMNTFieldsExplorer(Node):
         self.field_low_speed_pred_max = float(self.get_parameter("field_low_speed_pred_max").value)
         self.field_low_speed_penalty_weight = float(self.get_parameter("field_low_speed_penalty_weight").value)
         self.field_effective_speed_floor = float(self.get_parameter("field_effective_speed_floor").value)
-        self.field_diag_gate_enabled = bool(self.get_parameter("field_diag_gate_enabled").value)
-        self.field_diag_gate_min_replay_pairs = max(0, int(self.get_parameter("field_diag_gate_min_replay_pairs").value))
-        self.field_diag_max_low_overpred_frac = float(self.get_parameter("field_diag_max_low_overpred_frac").value)
-        self.field_diag_min_speed_corr = float(self.get_parameter("field_diag_min_speed_corr").value)
-        self.field_diag_min_near_far_gap = float(self.get_parameter("field_diag_min_near_far_gap").value)
-        self.field_diag_min_normal_cos_near = float(self.get_parameter("field_diag_min_normal_cos_near").value)
+        self.state_readiness_gate_enabled = bool(self.get_parameter("state_readiness_gate_enabled").value)
+        self.state_readiness_min_replay_states = max(
+            0, int(self.get_parameter("state_readiness_min_replay_states").value)
+        )
+        self.state_readiness_min_free_states = max(
+            1, int(self.get_parameter("state_readiness_min_free_states").value)
+        )
+        self.state_readiness_min_free_recall = float(np.clip(
+            float(self.get_parameter("state_readiness_min_free_recall").value), 0.0, 1.0
+        ))
+        self.state_readiness_max_false_free_rate = float(np.clip(
+            float(self.get_parameter("state_readiness_max_false_free_rate").value), 0.0, 1.0
+        ))
         self.field_false_free_audit_enabled = bool(
             self.get_parameter("field_false_free_audit_enabled").value
         )
@@ -532,6 +579,19 @@ class ArmMNTFieldsExplorer(Node):
         self.training_wall_time_limit_s = max(
             0.0, float(self.get_parameter("training_wall_time_limit_s").value)
         )
+        self.online_active_candidate_count = max(2048, int(self.get_parameter("online_active_candidate_count").value))
+        self.online_active_label_count = max(1, int(self.get_parameter("online_active_label_count").value))
+        self.online_relabel_count = max(1, int(self.get_parameter("online_relabel_count").value))
+        self.online_trajectory_problem_count = max(0, int(self.get_parameter("online_trajectory_problem_count").value))
+        self.online_certification_state_count = max(4096, int(self.get_parameter("online_certification_state_count").value))
+        self.online_certification_route_count = max(200, int(self.get_parameter("online_certification_route_count").value))
+        self.online_first_certification_s = max(0.0, float(self.get_parameter("online_first_certification_s").value))
+        self.online_final_certification_s = max(self.online_first_certification_s, float(self.get_parameter("online_final_certification_s").value))
+        self.online_min_early_stop_s = max(300.0, float(self.get_parameter("online_min_early_stop_s").value))
+        self.online_map_freeze_s = max(90.0, float(self.get_parameter("online_map_freeze_s").value))
+        self.online_map_freeze_min_coverage = float(np.clip(
+            float(self.get_parameter("online_map_freeze_min_coverage").value), 0.0, 1.0
+        ))
         self.goal_tool_orientation_yaw_offsets_rad = [
             float(v) for v in self.get_parameter("goal_tool_orientation_yaw_offsets_rad").value
         ]
@@ -586,6 +646,9 @@ class ArmMNTFieldsExplorer(Node):
 
         self.kinematics = UR5Kinematics(str(self.get_parameter("ur_type").value))
         self.voxel_map = SparseVoxelMap(float(self.get_parameter("voxel_size_m").value))
+        self.mapping_joint_sync_tolerance_s = max(
+            0.01, float(self.get_parameter("mapping_joint_sync_tolerance_s").value)
+        )
         self.frontier_bank = FrontierBank(
             float(self.get_parameter("frontier_match_radius_m").value),
             float(self.get_parameter("frontier_visit_radius_m").value),
@@ -610,6 +673,7 @@ class ArmMNTFieldsExplorer(Node):
             low_speed_penalty_weight=self.field_low_speed_penalty_weight,
             effective_speed_floor=self.field_effective_speed_floor,
         )
+        self.online_budget = OnlineTrainingBudget()
         self.goal_selector = ViewGoalSelector(
             self.kinematics,
             self.camera_in_tool,
@@ -638,7 +702,9 @@ class ArmMNTFieldsExplorer(Node):
         self.planner = ArmFieldPlanner(self.field_model, self.kinematics)
         self.exec_planner = JointSpaceRRTConnectPlanner(self.kinematics, rng=self.rng)
         self.robot_self_filter_checker = UR5PointCloudCollisionChecker(
-            self.kinematics, np.zeros((0, 3), dtype=np.float32)
+            self.kinematics,
+            np.zeros((0, 3), dtype=np.float32),
+            attached_spheres_local=wrist_camera_collision_spheres(self.camera_in_tool),
         )
 
         self.current_joints: np.ndarray | None = None
@@ -652,6 +718,15 @@ class ArmMNTFieldsExplorer(Node):
         self.using_fallback_camera_info = False
         self.step_idx = 0
         self.frame_count = 0
+        # Mapping callbacks can spend several seconds sampling and training.  Keep
+        # joint ingestion on an independent executor lane so the exposure-time
+        # history remains current while those callbacks are busy.
+        self.joint_state_history: deque[tuple[int, np.ndarray]] = deque(maxlen=2048)
+        self.joint_state_history_lock = threading.Lock()
+        self.joint_state_callback_group = ReentrantCallbackGroup()
+        self.total_depth_points = 0
+        self.total_self_points_removed = 0
+        self.mapping_pose_source_logged = False
         self.last_plan: np.ndarray | None = None
         self.latest_goal_meta: dict | None = None
         self.latest_color: np.ndarray | None = None
@@ -667,6 +742,7 @@ class ArmMNTFieldsExplorer(Node):
         self.network_initialized = False
         self.network_initialized_wall_time = 0.0
         self.training_finished = False
+        self.training_shutdown_timer = None
         self.final_artifacts_saved = False
         self.frontier_completion_empty_steps = 0
         self.frontiers_seen_since_init = False
@@ -682,13 +758,24 @@ class ArmMNTFieldsExplorer(Node):
         self.last_bootstrap_debug: dict[str, int] = {}
         self.last_roi_coverage: dict[str, float | int] = {}
         self.last_field_eval: dict[str, object] = {"success_ratio": 0.0, "success_count": 0, "evaluated": 0}
+        self.last_certification_metrics: CertificationMetrics | None = None
+        self.first_certification_attempted = False
+        self.final_certification_attempted = False
+        self.mapping_frozen = False
+        self.last_active_mining: dict[str, float] = {}
         self.recent_viewpoints: list[tuple[int, np.ndarray]] = []
         self.field_eval_anchor_cache_qs = np.zeros((0, 6), dtype=np.float64)
         self.field_eval_anchor_cache_step = -10_000
         self.field_eval_goal_candidate_cache: list[list[tuple[np.ndarray, float]]] = []
         self.field_eval_goal_candidate_cache_step = -10_000
 
-        self.create_subscription(JointState, self.joint_state_topic, self._joint_state_cb, 20)
+        self.create_subscription(
+            JointState,
+            self.joint_state_topic,
+            self._joint_state_cb,
+            2048,
+            callback_group=self.joint_state_callback_group,
+        )
         self.create_subscription(Image, self.color_topic, self._color_cb, qos_profile_sensor_data)
         self.create_subscription(CameraInfo, self.camera_info_topic, self._camera_info_cb, qos_profile_sensor_data)
         self.create_subscription(Image, self.depth_topic, self._depth_cb, qos_profile_sensor_data)
@@ -947,14 +1034,10 @@ class ArmMNTFieldsExplorer(Node):
         *,
         clearance_backend: str | None = None,
     ) -> UR5PointCloudCollisionChecker:
-        scene_boxes = self._scene_boxes_in_base()
         support_boxes = self._support_boxes_in_base()
-        if len(scene_boxes) and len(support_boxes):
-            box_obstacles = np.concatenate((scene_boxes, support_boxes), axis=0)
-        elif len(scene_boxes):
-            box_obstacles = scene_boxes
-        else:
-            box_obstacles = support_boxes
+        # Scene boxes define the mapping/sampling ROI only. Accumulated,
+        # self-filtered depth points are the obstacle source of truth.
+        box_obstacles = support_boxes
         backend = self.clearance_backend if clearance_backend is None else str(clearance_backend).strip().lower()
         return make_ur5_collision_checker(
             self.kinematics,
@@ -966,6 +1049,7 @@ class ArmMNTFieldsExplorer(Node):
             sdf_voxel_size_m=self.sdf_voxel_size_m,
             sdf_padding_m=self.sdf_padding_m,
             sdf_max_cells=self.sdf_max_cells,
+            attached_spheres_local=wrist_camera_collision_spheres(self.camera_in_tool),
         )
 
     def _clip_roi_bounds(self, lo: np.ndarray, hi: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1006,6 +1090,8 @@ class ArmMNTFieldsExplorer(Node):
         self.get_logger().info("Initializing network")
         self.network_initialized = True
         self.network_initialized_wall_time = time.monotonic()
+        self.online_budget.start(now=self.network_initialized_wall_time)
+        self.field_model.state_replay.set_map_version(self.voxel_map.map_version)
         self.get_logger().info(
             "Network initialization complete: "
             f"roi_source={self.frontier_roi_source}, occupied_points={len(occupied_points)}, "
@@ -1029,8 +1115,13 @@ class ArmMNTFieldsExplorer(Node):
     def _finish_training(self, reason: str, *, certified: bool = True):
         if self.training_finished:
             return
+        if certified and not bool(self.field_model.certification_passed):
+            self.get_logger().info(
+                f"Ignoring legacy completion trigger until balanced certification passes: {reason}"
+            )
+            return
         self.training_finished = True
-        enough_training = certified and (
+        enough_training = certified and self.mapping_frozen and bool(self.field_model.certification_passed) and (
             self.field_model.total_epochs_trained >= self.field_eval_min_train_steps
             and self.field_model.replay_size >= self.field_eval_min_replay_pairs
         )
@@ -1040,17 +1131,53 @@ class ArmMNTFieldsExplorer(Node):
             self.get_logger().info(f"Training stopped before completion: {reason}")
         checkpoint_name = "weights_final.pt" if enough_training else "weights_partial.pt"
         final_path = self.model_artifacts_dir / checkpoint_name
-        self.field_model.save_checkpoint(final_path)
+        metadata = checkpoint_scene_metadata(
+            self.voxel_map,
+            self.field_model.state_replay,
+            self.model_artifacts_dir,
+            training_wall_time=(
+                time.monotonic() - self.network_initialized_wall_time
+                if self.network_initialized_wall_time > 0.0 else 0.0
+            ),
+        )
+        metadata["certification_passed"] = bool(enough_training)
+        metadata["mapping_frozen"] = bool(self.mapping_frozen)
+        metadata["roi_coverage"] = dict(self.last_roi_coverage)
+        metadata["certification_metrics"] = (
+            None if self.last_certification_metrics is None
+            else self.last_certification_metrics.__dict__
+        )
+        self.field_model.checkpoint_metadata = dict(metadata)
+        self.field_model.save_checkpoint(final_path, metadata=metadata)
         self.field_model.save_loss_plot(self.model_artifacts_dir / "train_loss.png")
         self.final_artifacts_saved = True
         if not enough_training:
             self.get_logger().warn(
-                "Saved partial model checkpoint instead of weights_final.pt because training stopped before "
-                f"the configured minimums: epochs={self.field_model.total_epochs_trained}/"
+                "Saved partial model checkpoint instead of weights_final.pt because balanced certification "
+                f"or the configured minimums did not pass: epochs={self.field_model.total_epochs_trained}/"
                 f"{self.field_eval_min_train_steps}, replay={self.field_model.replay_size}/"
                 f"{self.field_eval_min_replay_pairs}. checkpoint={final_path}"
             )
         self._write_status()
+        # Completion is terminal for online training. A short one-shot timer
+        # lets checkpoint/status writes finish before stopping the executor;
+        # launch files propagate this node exit to Gazebo and the remaining
+        # mapping processes.
+        if self.training_shutdown_timer is None:
+            self.training_shutdown_timer = self.create_timer(
+                0.10, self._shutdown_after_training
+            )
+
+    def _shutdown_after_training(self):
+        timer = self.training_shutdown_timer
+        self.training_shutdown_timer = None
+        if timer is not None:
+            self.destroy_timer(timer)
+        self.get_logger().info(
+            "Training artifacts saved; shutting down the online mapping/training process."
+        )
+        if rclpy.ok():
+            rclpy.shutdown()
 
     def _joint_state_cb(self, msg: JointState):
         name_to_idx = {name: idx for idx, name in enumerate(msg.name)}
@@ -1058,6 +1185,10 @@ class ArmMNTFieldsExplorer(Node):
             return
         q = np.array([msg.position[name_to_idx[name]] for name in JOINT_NAMES], dtype=np.float64)
         self.current_joints = q
+        stamp_ns = int(msg.header.stamp.sec) * 1_000_000_000 + int(msg.header.stamp.nanosec)
+        if stamp_ns > 0:
+            with self.joint_state_history_lock:
+                self.joint_state_history.append((stamp_ns, q.copy()))
         self.current_joint_map = {name: float(val) for name, val in zip(JOINT_NAMES, q)}
         self.last_joint_state_wall_time = time.monotonic()
         now = self.last_joint_state_wall_time
@@ -1066,6 +1197,24 @@ class ArmMNTFieldsExplorer(Node):
             self.get_logger().info(
                 f"Joint state update: q={np.round(self.current_joints, 3).tolist()}"
             )
+
+    def _joint_state_at_stamp(self, stamp) -> np.ndarray | None:
+        """Return the closest joint state to an image exposure."""
+        target_ns = int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+        if target_ns <= 0:
+            return None if self.current_joints is None else self.current_joints.copy()
+        lock = getattr(self, "joint_state_history_lock", None)
+        if lock is None:
+            history = tuple(self.joint_state_history)
+        else:
+            with lock:
+                history = tuple(self.joint_state_history)
+        if not history:
+            return None
+        best_ns, best_q = min(history, key=lambda item: abs(item[0] - target_ns))
+        if abs(best_ns - target_ns) > int(self.mapping_joint_sync_tolerance_s * 1.0e9):
+            return None
+        return best_q.copy()
 
     def _joint_state_is_valid_for_planning(self) -> tuple[bool, float, str]:
         if self.current_joints is None or self.last_joint_state_wall_time <= 0.0:
@@ -1115,23 +1264,70 @@ class ArmMNTFieldsExplorer(Node):
         ]
         return info
 
-    def _lookup_camera_pose(self) -> np.ndarray | None:
+    def _lookup_camera_pose(self, stamp) -> np.ndarray | None:
+        """Return the camera pose at the depth exposure time.
+
+        Using Time() requested the newest transform and swept static cabinet
+        surfaces through space whenever the wrist moved between image capture
+        and callback execution.
+        """
         try:
-            tf = self.tf_buffer.lookup_transform(self.base_frame, self.camera_frame, rclpy.time.Time())
+            exposure_time = rclpy.time.Time.from_msg(stamp)
+            tf = self.tf_buffer.lookup_transform(
+                self.base_frame, self.camera_frame, exposure_time
+            )
         except TransformException as exc:
-            self.get_logger().warn(f"TF lookup failed: {exc}")
+            self.get_logger().warn(
+                "Timestamp-aligned camera TF lookup failed; dropping depth frame: "
+                f"stamp={int(stamp.sec)}.{int(stamp.nanosec):09d} error={exc}"
+            )
             return None
         return _transform_to_matrix(tf)
 
+    def _camera_pose_at_exposure(
+        self, stamp, q_at_exposure: np.ndarray
+    ) -> np.ndarray | None:
+        """Reconstruct the optical pose without waiting for delayed dynamic TF.
+
+        The explorer normally maps in ``base_link``. Its timestamp-matched
+        joint state is the authoritative robot pose and uses the same FK and
+        calibrated tool-to-optical transform as view planning. Historical TF
+        remains the fallback for deployments that request another map frame.
+        """
+        if self.base_frame == "base_link":
+            tool_pose = self.kinematics.fk(
+                np.asarray(q_at_exposure, dtype=np.float64).reshape(6)
+            )
+            if not self.mapping_pose_source_logged:
+                self.get_logger().info(
+                    "Depth mapping camera poses use timestamp-matched joint-state FK "
+                    "(base_link frame); delayed dynamic TF will not drop moving frames."
+                )
+                self.mapping_pose_source_logged = True
+            return self.kinematics.tool_to_camera_pose(tool_pose, self.camera_in_tool)
+        return self._lookup_camera_pose(stamp)
+
     def _depth_cb(self, depth_msg: Image):
         callback_t0 = time.perf_counter()
+        if self.training_finished:
+            return
         if self.current_joints is None:
             return
         info_msg = self._effective_camera_info(depth_msg)
         if info_msg is None:
             return
         self.frame_count += 1
-        camera_pose = self._lookup_camera_pose()
+        exposure_q = self._joint_state_at_stamp(depth_msg.header.stamp)
+        if exposure_q is None:
+            self.get_logger().warn(
+                "No joint state close enough to depth exposure; dropping frame to protect map alignment: "
+                f"stamp={int(depth_msg.header.stamp.sec)}.{int(depth_msg.header.stamp.nanosec):09d} "
+                f"tolerance_s={self.mapping_joint_sync_tolerance_s:.3f}"
+            )
+            return
+        camera_pose = self._camera_pose_at_exposure(
+            depth_msg.header.stamp, exposure_q
+        )
         if camera_pose is None:
             return
         tf_t1 = time.perf_counter()
@@ -1141,7 +1337,9 @@ class ArmMNTFieldsExplorer(Node):
             depth *= 0.001
         points = self._depth_to_world(depth, info_msg, camera_pose)
         raw_depth_points = int(len(points))
-        points, self_points_removed = self._filter_robot_self_points(points)
+        points, self_points_removed = self._filter_robot_self_points(points, exposure_q)
+        self.total_depth_points += raw_depth_points
+        self.total_self_points_removed += self_points_removed
         points_t2 = time.perf_counter()
         if points.size == 0:
             if self.frame_count % 15 == 0:
@@ -1152,7 +1350,19 @@ class ArmMNTFieldsExplorer(Node):
             return
 
         self.step_idx += 1
-        self.voxel_map.integrate_points(camera_pose[:3, 3], points)
+        if not self.mapping_frozen:
+            self.voxel_map.integrate_points(camera_pose[:3, 3], points, update_version=False)
+            if exposure_q is not None:
+                robot_centers, robot_radii = self.robot_self_filter_checker.robot_spheres(
+                    np.asarray(exposure_q, dtype=np.float64)
+                )
+                self.voxel_map.integrate_known_free_spheres(
+                    robot_centers,
+                    robot_radii + self.robot_self_filter_padding_m,
+                    update_version=False,
+                )
+            self.voxel_map.update_map_version()
+        self.field_model.state_replay.set_map_version(self.voxel_map.map_version)
         occupied_points = self.voxel_map.occupied_points()
         self._maybe_initialize_frontier_roi(occupied_points)
         self._publish_debug_point_cloud(occupied_points, depth_msg.header.stamp)
@@ -1162,6 +1372,22 @@ class ArmMNTFieldsExplorer(Node):
         self.frontier_bank.mark_visited_near(camera_pose[:3, 3])
         checker = self._make_collision_checker(occupied_points)
         checker.free_keys = set(self.voxel_map.free)
+        if self.network_initialized and not self.mapping_frozen:
+            map_elapsed = time.monotonic() - self.network_initialized_wall_time
+            if map_elapsed >= self.online_map_freeze_s:
+                freeze_stats = self._roi_coverage_stats(checker)
+                if float(freeze_stats.get("coverage", 0.0)) >= self.online_map_freeze_min_coverage:
+                    self.mapping_frozen = True
+                    self.last_roi_coverage = freeze_stats
+                    kept, discarded = self.field_model.state_replay.limit_stale(
+                        6 * self.online_relabel_count
+                    )
+                    self.get_logger().info(
+                        "Final training map frozen: "
+                        f"elapsed_s={map_elapsed:.1f} map_version={self.voxel_map.map_version} "
+                        f"roi_coverage={float(freeze_stats['coverage']):.3f} "
+                        f"stale_kept_for_relabelling={kept} stale_discarded={discarded}"
+                    )
         # Lazily created for the expensive online-only paths below. The exact
         # checker remains the source of truth for planner validation.
         fast_clearance_checker: UR5PointCloudCollisionChecker | None = None
@@ -1177,7 +1403,9 @@ class ArmMNTFieldsExplorer(Node):
                 f"step={self.step_idx} depth callback: tf_ms={(tf_t1 - callback_t0) * 1e3:.1f} "
                 f"points_ms={(points_t2 - tf_t1) * 1e3:.1f} map_ms={(map_t3 - points_t2) * 1e3:.1f} "
                 f"raw_points={raw_depth_points} filtered_points={len(points)} "
-                f"self_removed={self_points_removed} occupied={len(occupied_points)} frontiers={len(clusters)} "
+                f"self_removed={self_points_removed} "
+                f"self_removed_total={self.total_self_points_removed}/{self.total_depth_points} "
+                f"occupied={len(occupied_points)} frontiers={len(clusters)} "
                 f"{roi_status}"
             )
 
@@ -1190,16 +1418,75 @@ class ArmMNTFieldsExplorer(Node):
         if not self._maybe_initialize_network(occupied_points):
             self._publish_frontiers()
             return
+        elapsed = time.monotonic() - self.network_initialized_wall_time
+        certification_due = (
+            elapsed >= self.online_first_certification_s and not self.first_certification_attempted
+        )
+        final_certification_due = (
+            elapsed >= self.online_final_certification_s and not self.final_certification_attempted
+        )
+        if certification_due or final_certification_due:
+            coverage = self._roi_coverage_stats(checker)
+            mapping_ready = (
+                self.mapping_frozen
+                and float(coverage.get("coverage", 0.0)) >= self.online_map_freeze_min_coverage
+            )
+            if certification_due:
+                self.first_certification_attempted = True
+            if final_certification_due:
+                self.final_certification_attempted = True
+            if not mapping_ready:
+                self.get_logger().warn(
+                    "Balanced certification deferred because the final map is not coverage-qualified: "
+                    f"mapping_frozen={self.mapping_frozen} "
+                    f"roi_coverage={float(coverage.get('coverage', 0.0)):.3f} "
+                    f"required={self.online_map_freeze_min_coverage:.3f}"
+                )
+                if final_certification_due:
+                    self._finish_training(
+                        "final certification refused because mapping did not reach the required coverage",
+                        certified=False,
+                    )
+                    self._publish_frontiers()
+                    return
+            else:
+                metrics = self._run_balanced_certification(checker)
+            if mapping_ready and metrics.passed and elapsed >= self.online_min_early_stop_s:
+                self._finish_training(
+                    f"balanced certification passed at {elapsed:.1f}s", certified=True
+                )
+                self._publish_frontiers()
+                return
+            if final_certification_due and mapping_ready:
+                # Focused recovery has already consumed the 600-660 s window.
+                # Do not enter another long sampling/training callback that can
+                # overrun the 720 s hard limit after the final audit failed.
+                self._finish_training(
+                    f"final balanced certification failed at {elapsed:.1f}s",
+                    certified=False,
+                )
+                self._publish_frontiers()
+                return
         if (
             self.training_wall_time_limit_s > 0.0
-            and self.network_initialized_wall_time > 0.0
-            and time.monotonic() - self.network_initialized_wall_time
-            >= self.training_wall_time_limit_s
+            and elapsed >= self.training_wall_time_limit_s
         ):
-            elapsed = time.monotonic() - self.network_initialized_wall_time
+            coverage = self._roi_coverage_stats(checker)
+            mapping_ready = (
+                self.mapping_frozen
+                and float(coverage.get("coverage", 0.0)) >= self.online_map_freeze_min_coverage
+            )
+            if not self.final_certification_attempted and mapping_ready:
+                self.last_certification_metrics = self._run_balanced_certification(checker)
+                self.final_certification_attempted = True
+            passed = bool(
+                mapping_ready
+                and self.last_certification_metrics
+                and self.last_certification_metrics.passed
+            )
             self._finish_training(
-                f"wall-time limit reached ({elapsed:.1f}s) before raw field evaluation passed",
-                certified=False,
+                f"hard wall-time limit reached ({elapsed:.1f}s); final certification_passed={passed}",
+                certified=passed,
             )
             self._publish_frontiers()
             return
@@ -1297,6 +1584,17 @@ class ArmMNTFieldsExplorer(Node):
             active_hard_failed_pairs,
             adaptive_ready,
         ) = self._active_training_schedule()
+        focused_recovery = (
+            self.mapping_frozen
+            and elapsed < self.online_final_certification_s
+            and self.first_certification_attempted
+            and not bool(self.last_certification_metrics and self.last_certification_metrics.passed)
+        )
+        mapping_bootstrap_active = not self.mapping_frozen
+        if focused_recovery:
+            active_sample_pairs = 0
+            active_recombine_pairs = 0
+            active_hard_failed_pairs = 0
         should_train_this_frame = (
             self.training_frame_idx == 1
             or (
@@ -1305,6 +1603,23 @@ class ArmMNTFieldsExplorer(Node):
                 and (self.training_frame_idx - 1) % active_train_every_n_frames == 0
             )
         )
+        # Sampling and optimization in the depth callback previously starved
+        # depth ingestion and repeatedly trained on an incomplete changing map.
+        # The first phase now belongs exclusively to mapping; training begins
+        # only after the coverage-qualified map has been frozen.
+        if mapping_bootstrap_active:
+            should_train_this_frame = False
+            if self.step_idx <= 3 or self.step_idx % 5 == 0:
+                bootstrap_coverage = self._roi_coverage_stats(checker)
+                self.last_roi_coverage = bootstrap_coverage
+                self.get_logger().info(
+                    f"step={self.step_idx} mapping-only bootstrap: elapsed_s={elapsed:.1f}/"
+                    f"{self.online_map_freeze_s:.1f} "
+                    f"roi_coverage={float(bootstrap_coverage['coverage']):.3f}/"
+                    f"{self.online_map_freeze_min_coverage:.3f} "
+                    f"known={int(bootstrap_coverage['known'])} "
+                    f"unknown={int(bootstrap_coverage['unknown'])}; optimizer paused"
+                )
         if self.defer_training_until_motion and self.current_joints is not None and self.defer_training_q is not None:
             joint_motion = float(
                 np.max(np.abs(np.asarray(self.current_joints, dtype=np.float64) - self.defer_training_q))
@@ -1596,11 +1911,24 @@ class ArmMNTFieldsExplorer(Node):
                     f"eval_replay_target={self.field_eval_min_replay_pairs}"
                 )
                 train_t0 = time.perf_counter()
+                base_qn = np.concatenate(
+                    (persistent_frame_rows[:, :6], persistent_frame_rows[:, 6:12]), axis=0
+                ) if len(persistent_frame_rows) else np.zeros((0, 6), dtype=np.float32)
+                state_rows = assign_clearance_sources(
+                    self._exact_state_rows(checker, base_qn, SampleSource.BROAD)
+                )
+                transient_state_rows = np.zeros((0, 17), dtype=np.float32)
+                hard_qn = np.concatenate(
+                    (frame_rows_hard[:, :6], frame_rows_hard[:, 6:12]), axis=0
+                ) if len(frame_rows_hard) else np.zeros((0, 6), dtype=np.float32)
+                hard_state_rows = self._exact_state_rows(
+                    checker, hard_qn, SampleSource.FALSE_FREE
+                )
                 loss = self.field_model.train_step(
-                    persistent_frame_rows,
+                    state_rows,
                     active_train_steps,
-                    transient_rows=recombined_rows,
-                    priority_rows=frame_rows_hard,
+                    transient_rows=transient_state_rows,
+                    priority_rows=hard_state_rows,
                 )
                 train_t1 = time.perf_counter()
                 self.get_logger().info(
@@ -1612,6 +1940,23 @@ class ArmMNTFieldsExplorer(Node):
                     f"train_ms={(train_t1 - train_t0) * 1e3:.1f}"
                 )
                 self.training_update_count += 1
+                mining = self._online_relabel_and_active_mine(checker)
+                audit_passed, audit_reason = self._field_false_free_audit(checker)
+                elapsed_online = time.monotonic() - self.network_initialized_wall_time
+                trajectory_mining = {"attempted": 0, "generated": 0, "colliding": 0, "added_states": 0}
+                if elapsed_online >= 90.0:
+                    trajectory_mining = self._mine_learned_trajectories(
+                        checker, self.online_trajectory_problem_count
+                    )
+                self.get_logger().info(
+                    f"step={self.step_idx} active mining: candidates={int(mining['candidate_states'])} "
+                    f"labelled={int(mining['labelled_states'])} false_free={int(mining['false_free_states'])} "
+                    f"false_blocked={int(mining['false_blocked_states'])} "
+                    f"relabelled={int(mining['relabelled_states'])} stale={int(mining['stale_remaining'])} "
+                    f"loss={mining['loss']:.5f} ms={mining['ms']:.1f} "
+                    f"audit_passed={audit_passed} audit={audit_reason} "
+                    f"trajectory={trajectory_mining}"
+                )
                 should_run_diagnostics = (
                     self.training_update_count == 1
                     or self.training_update_count % self.field_diagnostics_every_n_train_updates == 0
@@ -1634,13 +1979,11 @@ class ArmMNTFieldsExplorer(Node):
                             f"step={self.step_idx} field diagnostics: rows={int(diag.get('diag_rows', 0.0))} "
                             f"speed_mae={diag.get('speed_mae', 0.0):.4f} "
                             f"speed_corr={diag.get('speed_corr', 0.0):.3f} "
-                            f"pred_near={diag.get('pred_near_mean', 0.0):.3f} "
-                            f"pred_far={diag.get('pred_far_mean', 0.0):.3f} "
-                            f"near_far_gap={diag.get('near_far_gap', 0.0):.3f} "
-                            f"normal_cos_near={diag.get('normal_cos_near_mean', 0.0):.3f} "
-                            f"grad_goal_cos={diag.get('grad_goal_cos_mean', 0.0):.3f} "
-                            f"grad_goal_neg_frac={diag.get('grad_goal_neg_frac', 0.0):.3f} "
-                            f"low_overpred={diag.get('low_target_overpred_frac', 0.0):.3f} "
+                            f"free_recall={diag.get('free_state_recall', 0.0):.3f} "
+                            f"free_speed_pass={diag.get('free_speed_pass_rate', 0.0):.3f} "
+                            f"free_unsafe_pass={diag.get('free_unsafe_pass_rate', 0.0):.3f} "
+                            f"false_blocked={diag.get('false_blocked_free_rate', 1.0):.3f} "
+                            f"false_free={diag.get('low_target_overpred_frac', 0.0):.3f} "
                             f"diag_ms={(diag_t1 - diag_t0) * 1e3:.1f}"
                         )
                 self._save_step_artifacts(
@@ -1660,15 +2003,44 @@ class ArmMNTFieldsExplorer(Node):
                 )
                 self._save_model_artifacts_if_needed()
             else:
-                self.get_logger().info(
-                    f"step={self.step_idx} post_startup_frame={self.training_frame_idx} "
-                    "skipped training: no valid 6-DoF samples passed clearance filters."
-                )
+                if focused_recovery:
+                    mining = self._online_relabel_and_active_mine(checker)
+                    valid_replay = self.field_model.state_replay.valid_rows()
+                    recovery_loss = None
+                    if len(valid_replay):
+                        recovery_loss = self.field_model.train_step(
+                            valid_replay[:1], epochs=active_train_steps
+                        )
+                    audit_passed, audit_reason = self._field_false_free_audit(checker)
+                    trajectory_mining = self._mine_learned_trajectories(
+                        checker, self.online_trajectory_problem_count
+                    )
+                    self.training_update_count += 1
+                    self.get_logger().info(
+                        f"step={self.step_idx} focused recovery: mining={mining} "
+                        f"replay_loss={-1.0 if recovery_loss is None else recovery_loss:.5f} "
+                        f"audit_passed={audit_passed} audit={audit_reason} "
+                        f"trajectory={trajectory_mining}"
+                    )
+                else:
+                    self.get_logger().info(
+                        f"step={self.step_idx} post_startup_frame={self.training_frame_idx} "
+                        "skipped training: no valid 6-DoF samples passed clearance filters."
+                    )
             self._maybe_finish_for_roi_coverage(checker)
             self._maybe_finish_for_field_eval(checker)
             if self.training_finished:
                 self._publish_frontiers()
                 return
+
+        if self.mapping_frozen:
+            if self.step_idx % 5 == 0:
+                self.get_logger().info(
+                    f"step={self.step_idx} final map is frozen; skipping NBV selection and "
+                    "keeping the robot stationary for focused training."
+                )
+            self._publish_frontiers()
+            return
 
         if is_executing:
             if self.step_idx % 5 == 0:
@@ -1984,13 +2356,16 @@ class ArmMNTFieldsExplorer(Node):
         pts_w = (camera_pose[:3, :3] @ pts_c.T).T + camera_pose[:3, 3][None, :]
         return pts_w.astype(np.float32)
 
-    def _filter_robot_self_points(self, points: np.ndarray) -> tuple[np.ndarray, int]:
-        if not self.enable_robot_self_filter or self.current_joints is None:
+    def _filter_robot_self_points(
+        self, points: np.ndarray, q_at_exposure: np.ndarray
+    ) -> tuple[np.ndarray, int]:
+        if not self.enable_robot_self_filter:
             return points, 0
-        extra_spheres = self._tool_camera_self_filter_spheres(self.current_joints)
+        q = np.asarray(q_at_exposure, dtype=np.float64).reshape(6)
+        extra_spheres = self._tool_camera_self_filter_spheres(q)
         return self.robot_self_filter_checker.filter_robot_self_points(
             points,
-            np.asarray(self.current_joints, dtype=np.float64),
+            q,
             padding_m=self.robot_self_filter_padding_m,
             extra_spheres=extra_spheres,
         )
@@ -2014,6 +2389,7 @@ class ArmMNTFieldsExplorer(Node):
         scene_bbox = self._scene_boxes_bbox()
         if scene_bbox is not None:
             self.frontier_roi_min, self.frontier_roi_max = scene_bbox
+            self.voxel_map.set_roi(self.frontier_roi_min, self.frontier_roi_max, 0.5)
             self.frontier_roi_source = "scene_boxes"
             self.get_logger().info(
                 "Initialized enclosed-space ROI from scene_boxes: "
@@ -2030,6 +2406,7 @@ class ArmMNTFieldsExplorer(Node):
         lo, hi = self._clip_roi_bounds(lo, hi)
         self.frontier_roi_min = lo
         self.frontier_roi_max = hi
+        self.voxel_map.set_roi(self.frontier_roi_min, self.frontier_roi_max, 0.5)
         self.frontier_roi_source = "occupied_points"
         self.get_logger().info(
             "Initialized enclosed-space ROI: "
@@ -2269,45 +2646,42 @@ class ArmMNTFieldsExplorer(Node):
             self.field_eval_goal_candidate_cache_step = int(self.step_idx)
         return computed
 
-    def _field_diagnostics_gate_passed(self) -> tuple[bool, str]:
-        if not self.field_diag_gate_enabled:
+    def _state_readiness_gate_passed(self) -> tuple[bool, str]:
+        if not self.state_readiness_gate_enabled:
             return True, "disabled"
-        if self.field_model.replay_size < self.field_diag_gate_min_replay_pairs:
+        if self.field_model.replay_size < self.state_readiness_min_replay_states:
             return (
                 False,
                 f"replay_size={self.field_model.replay_size} "
-                f"min_required={self.field_diag_gate_min_replay_pairs}",
+                f"min_required={self.state_readiness_min_replay_states}",
             )
         diag = dict(self.field_model.last_diagnostics or {})
         if float(diag.get("diag_rows", 0.0)) <= 0.0:
             diag = self.field_model.evaluate_replay_diagnostics(self.field_diagnostics_max_rows)
         failures: list[str] = []
-        speed_corr = float(diag.get("speed_corr", 0.0))
-        near_far_gap = float(diag.get("near_far_gap", 0.0))
-        normal_cos_near = float(diag.get("normal_cos_near_mean", 0.0))
+        free_count = int(diag.get("free_target_count", 0.0))
+        free_recall = float(diag.get("free_state_recall", 0.0))
+        false_blocked = float(diag.get("false_blocked_free_rate", 1.0))
         low_count = int(diag.get("low_target_count", 0.0))
-        low_overpred = float(diag.get("low_target_overpred_frac", 0.0))
-        if speed_corr < self.field_diag_min_speed_corr:
-            failures.append(f"speed_corr={speed_corr:.3f}<{self.field_diag_min_speed_corr:.3f}")
-        if near_far_gap < self.field_diag_min_near_far_gap:
-            failures.append(f"near_far_gap={near_far_gap:.3f}<{self.field_diag_min_near_far_gap:.3f}")
-        normal_supervised = (
-            self.field_normal_loss_weight > 0.0 or self.field_normal_cos_loss_weight > 0.0
-        )
-        if normal_supervised and normal_cos_near < self.field_diag_min_normal_cos_near:
+        false_free = float(diag.get("low_target_overpred_frac", 1.0))
+        if free_count < self.state_readiness_min_free_states:
+            failures.append(f"free_states={free_count}<{self.state_readiness_min_free_states}")
+        if free_recall < self.state_readiness_min_free_recall:
             failures.append(
-                f"normal_cos_near={normal_cos_near:.3f}<{self.field_diag_min_normal_cos_near:.3f}"
+                f"free_recall={free_recall:.3f}<{self.state_readiness_min_free_recall:.3f}"
             )
-        if low_count >= 64 and low_overpred > self.field_diag_max_low_overpred_frac:
+        if low_count >= 64 and false_free > self.state_readiness_max_false_free_rate:
             failures.append(
-                f"low_overpred={low_overpred:.3f}>{self.field_diag_max_low_overpred_frac:.3f}"
+                f"false_free={false_free:.3f}>{self.state_readiness_max_false_free_rate:.3f}"
             )
         if failures:
             return False, ", ".join(failures)
         return (
             True,
-            f"speed_corr={speed_corr:.3f}, near_far_gap={near_far_gap:.3f}, "
-            f"normal_cos_near={normal_cos_near:.3f}, low_overpred={low_overpred:.3f}",
+            f"free_recall={free_recall:.3f}, false_blocked={false_blocked:.3f}, "
+            f"free_speed_pass={float(diag.get('free_speed_pass_rate', 0.0)):.3f}, "
+            f"free_unsafe_pass={float(diag.get('free_unsafe_pass_rate', 0.0)):.3f}, "
+            f"false_free={false_free:.3f}",
         )
 
     def _field_false_free_audit(
@@ -2360,9 +2734,19 @@ class ArmMNTFieldsExplorer(Node):
         target = floor + (1.0 - floor) * alpha
 
         qn = self.kinematics.normalize(q)
-        query_qn = np.repeat(qn, goals_per_state, axis=0)
         goal_qn = self.kinematics.normalize(goal_q)
-        pred, _ = self.field_model.predict_normalized_pair_speeds(query_qn, goal_qn, batch_size=1024)
+        if hasattr(self.field_model, "predict_normalized_state_geometry"):
+            _raw_pred, unsafe_probability, conservative_pred = (
+                self.field_model.predict_normalized_state_geometry(qn, batch_size=4096)
+            )
+            pred = np.repeat(conservative_pred, goals_per_state)
+            pred[np.repeat(unsafe_probability >= 0.10, goals_per_state)] = 0.0
+        else:
+            # Legacy diagnostic test doubles and v2 audit tooling.
+            query_qn = np.repeat(qn, goals_per_state, axis=0)
+            pred, _ = self.field_model.predict_normalized_pair_speeds(
+                query_qn, goal_qn, batch_size=1024
+            )
         query_clearances = np.repeat(clearances, goals_per_state)
         query_target = np.repeat(target, goals_per_state)
         finite = np.isfinite(query_clearances) & np.isfinite(query_target) & np.isfinite(pred)
@@ -2416,6 +2800,20 @@ class ArmMNTFieldsExplorer(Node):
             if len(merged) > self.hard_failed_anchor_buffer_limit:
                 merged = merged[-self.hard_failed_anchor_buffer_limit :]
             self.hard_failed_anchor_qs = merged.astype(np.float64, copy=False)
+            if (
+                hasattr(self.kinematics, "denormalize")
+                and hasattr(self.field_model, "train_step")
+                and hasattr(self, "voxel_map")
+            ):
+                hard_qn = np.asarray(
+                    [self.kinematics.normalize(row) for row in anchors], dtype=np.float32
+                )
+                hard_rows = self._exact_state_rows(
+                    checker, hard_qn, SampleSource.FALSE_FREE
+                )
+                self.field_model.train_step(
+                    hard_rows, epochs=1, priority_rows=hard_rows
+                )
 
         self.last_false_free_audit_step = int(self.step_idx)
         self.last_false_free_audit = {
@@ -2430,16 +2828,412 @@ class ArmMNTFieldsExplorer(Node):
         }
         return passed, reason
 
+    def _exact_state_rows(
+        self,
+        checker: UR5PointCloudCollisionChecker,
+        qn: np.ndarray,
+        source: SampleSource,
+        *,
+        supported_only: bool = True,
+        return_support: bool = False,
+    ) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+        qn = np.asarray(qn, dtype=np.float32).reshape(-1, 6)
+        if len(qn) == 0:
+            empty = np.zeros((0, 17), dtype=np.float32)
+            if return_support:
+                return empty, np.zeros((0,), dtype=bool)
+            return empty
+        q = np.asarray([self.kinematics.denormalize(row) for row in qn], dtype=np.float32)
+        rows, observed = exact_label_states(
+            checker,
+            self.kinematics,
+            self.voxel_map,
+            q,
+            clearance_margin_m=self.clearance_margin_m,
+            clearance_offset_m=self.clearance_offset_m,
+            source=source,
+            return_observed=True,
+        )
+        # Preserve physical collisions even though an occupied robot sphere is
+        # not ray-observed free. Unknown free states are omitted: coverage, not
+        # the geometry classifier, is responsible for failing those closed.
+        support = np.asarray(observed, dtype=bool) | (rows[:, 6] <= 0.0)
+        result = rows[support] if supported_only else rows
+        if return_support:
+            return result, support
+        return result
+
+    def _online_relabel_and_active_mine(
+        self, checker: UR5PointCloudCollisionChecker
+    ) -> dict[str, float]:
+        timing_t0 = time.perf_counter()
+        stale = self.field_model.state_replay.stale_rows()
+        relabelled_count = 0
+        if len(stale):
+            stale_batch = self.field_model.state_replay.stale_rows_balanced(
+                self.online_relabel_count
+            )
+            relabel_parts = []
+            for source_value in np.unique(np.rint(stale_batch[:, 15]).astype(np.int32)):
+                mask = np.rint(stale_batch[:, 15]).astype(np.int32) == source_value
+                try:
+                    source = SampleSource(int(source_value))
+                except ValueError:
+                    source = SampleSource.COVERAGE
+                relabel_parts.append(self._exact_state_rows(checker, stale_batch[mask, :6], source))
+            relabelled = np.concatenate(relabel_parts, axis=0) if relabel_parts else np.zeros((0, 17), dtype=np.float32)
+            self.field_model.state_replay.replace_relabelled(relabelled)
+            relabelled_count = len(relabelled)
+
+        candidates = select_active_candidates(
+            self.field_model,
+            self.field_model.state_replay,
+            candidate_count=self.online_active_candidate_count,
+            label_count=self.online_active_label_count,
+            seed=7919 + self.training_update_count,
+        )
+        labelled_all, supported = self._exact_state_rows(
+            checker,
+            candidates,
+            SampleSource.COVERAGE,
+            supported_only=False,
+            return_support=True,
+        )
+        candidates = candidates[supported]
+        labelled = labelled_all[supported]
+        pred, unsafe_probability, conservative = self.field_model.predict_normalized_state_geometry(candidates)
+        hard_mask = false_free_mask(pred, unsafe_probability, labelled[:, 7])
+        false_blocked_mask = (
+            (labelled[:, 6] >= 0.03)
+            & (labelled[:, 14] < 0.5)
+            & (
+                (np.asarray(conservative) < 0.20)
+                | (np.asarray(unsafe_probability) >= 0.10)
+            )
+        )
+        labelled[false_blocked_mask, 15] = float(SampleSource.TRAJECTORY)
+        blocked_rows = labelled[false_blocked_mask].copy()
+        hard = labelled[hard_mask].copy()
+        if len(hard):
+            hard[:, 15] = float(SampleSource.FALSE_FREE)
+            inside, outside = paired_shell_states(hard[:, :6], hard[:, 8:14], epsilon=0.005)
+            shell_rows = np.concatenate(
+                (
+                    self._exact_state_rows(checker, inside, SampleSource.FALSE_FREE),
+                    self._exact_state_rows(checker, outside, SampleSource.FREE_BAND),
+                ),
+                axis=0,
+            )
+            labelled = np.concatenate((labelled, hard, shell_rows), axis=0)
+            hard_q = np.asarray(
+                [self.kinematics.denormalize(row) for row in hard[:, :6]], dtype=np.float64
+            )
+            self._append_hard_failed_anchors(hard_q)
+        self.field_model.add_rows(labelled)
+        priority_parts = [part for part in (hard, blocked_rows) if len(part)]
+        priority = (
+            np.concatenate(priority_parts, axis=0)
+            if priority_parts else None
+        )
+        mining_loss = self.field_model.train_step(
+            labelled, epochs=1, priority_rows=priority
+        )
+
+        valid = self.field_model.state_replay.valid_rows()
+        if len(valid):
+            # Temporary maximum support is used only for training-time learned
+            # trajectory generation. Certification replaces both radii with
+            # held-out calibrated values before a final checkpoint can exist.
+            self.field_model.set_coverage_support(valid[:, :6], 0.08, 0.08)
+        result = {
+            "candidate_states": float(len(candidates)),
+            "labelled_states": float(len(labelled)),
+            "false_free_states": float(np.count_nonzero(hard_mask)),
+            "false_blocked_states": float(np.count_nonzero(false_blocked_mask)),
+            "relabelled_states": float(relabelled_count),
+            "stale_remaining": float(len(self.field_model.state_replay.stale_rows())),
+            "ms": (time.perf_counter() - timing_t0) * 1.0e3,
+            "loss": -1.0 if mining_loss is None else float(mining_loss),
+        }
+        self.last_active_mining = result
+        return result
+
+    @staticmethod
+    def _densify_joint_path(path: np.ndarray, max_step_rad: float = 0.04) -> np.ndarray:
+        points = np.asarray(path, dtype=np.float32).reshape(-1, 6)
+        if len(points) <= 1:
+            return points
+        dense = [points[0]]
+        for qa, qb in zip(points[:-1], points[1:]):
+            segments = max(1, int(np.ceil(np.max(np.abs(qb - qa)) / max(1.0e-4, max_step_rad))))
+            dense.extend(np.linspace(qa, qb, segments + 1, dtype=np.float32)[1:])
+        return np.asarray(dense, dtype=np.float32)
+
+    def _state_region_codes(self, state_rows: np.ndarray) -> np.ndarray:
+        rows = np.asarray(state_rows, dtype=np.float32).reshape(-1, 17)
+        if len(rows) == 0:
+            return np.zeros((0,), dtype=np.int32)
+        xyz = np.asarray(
+            [self.kinematics.fk(self.kinematics.denormalize(row[:6]))[:3, 3] for row in rows],
+            dtype=np.float64,
+        )
+        if self.frontier_roi_min is not None and self.frontier_roi_max is not None:
+            mid = 0.5 * (self.frontier_roi_min + self.frontier_roi_max)
+        else:
+            mid = np.median(xyz, axis=0)
+        return ((xyz[:, 1] >= mid[1]).astype(np.int32) + 2 * (xyz[:, 2] >= mid[2]).astype(np.int32))
+
+    @staticmethod
+    def _region_pair_indices(
+        rng: np.random.Generator, region_codes: np.ndarray, cross_region: bool
+    ) -> tuple[int, int] | None:
+        codes = np.asarray(region_codes, dtype=np.int32)
+        if len(codes) < 2:
+            return None
+        for _ in range(32):
+            a, b = rng.choice(len(codes), size=2, replace=False)
+            if bool(codes[a] != codes[b]) == bool(cross_region):
+                return int(a), int(b)
+        return None
+
+    def _mine_learned_trajectories(
+        self, checker: UR5PointCloudCollisionChecker, problem_count: int
+    ) -> dict[str, int]:
+        valid = self.field_model.state_replay.valid_rows()
+        free = valid[(valid[:, 7] >= 0.50) & (valid[:, 14] < 0.5)] if len(valid) else valid
+        requested = max(0, int(problem_count))
+        if len(free) < 2 or requested == 0:
+            return {
+                "attempted": 0, "generated": 0, "rejected": 0,
+                "colliding": 0, "false_blocked": 0, "added_states": 0,
+            }
+        rng = np.random.default_rng(15485863 + self.training_update_count)
+        region_codes = self._state_region_codes(free)
+        generated = 0
+        colliding = 0
+        rejected = 0
+        false_blocked = 0
+        mined_parts: list[np.ndarray] = []
+        for problem_index in range(requested):
+            pair = self._region_pair_indices(rng, region_codes, cross_region=bool(problem_index % 2))
+            if pair is None:
+                continue
+            qa = self.kinematics.denormalize(free[pair[0], :6])
+            qb = self.kinematics.denormalize(free[pair[1], :6])
+            path = self.planner.plan_learned_speed_search(
+                qa, qb, step_size_q=self.step_size_q, max_steps=min(self.rollout_max_steps, 120),
+                min_predicted_speed=0.20, max_local_candidates=self.field_local_rollout_candidates,
+                allow_direct_edge=True, mode="bidirectional", time_budget_ms=90.0,
+            )
+            if np.asarray(path).ndim != 2 or len(path) < 2:
+                rejected += 1
+                probe = self._densify_joint_path(np.vstack((qa, qb)))
+                probe_qn = np.asarray(
+                    [self.kinematics.normalize(row) for row in probe], dtype=np.float32
+                )
+                probe_rows_all, supported = self._exact_state_rows(
+                    checker,
+                    probe_qn,
+                    SampleSource.TRAJECTORY,
+                    supported_only=False,
+                    return_support=True,
+                )
+                probe_qn = probe_qn[supported]
+                probe_rows = probe_rows_all[supported]
+                if len(probe_rows) == 0:
+                    continue
+                raw_speed, predicted_unsafe, conservative = (
+                    self.field_model.predict_normalized_state_geometry(probe_qn)
+                )
+                tree = self.field_model.state_replay.coverage_tree()
+                unsupported = np.ones(len(probe_qn), dtype=bool)
+                if tree is not None:
+                    distance, _ = tree.query(probe_qn, k=1)
+                    radii = np.where(
+                        np.asarray(raw_speed) < 0.5,
+                        float(self.field_model.shell_coverage_radius),
+                        float(self.field_model.free_coverage_radius),
+                    )
+                    unsupported = np.asarray(distance) > radii
+                exact_free = (probe_rows[:, 6] >= 0.03) & (probe_rows[:, 14] < 0.5)
+                blocked = exact_free & (
+                    (np.asarray(conservative) < 0.20)
+                    | (np.asarray(predicted_unsafe) >= 0.10)
+                    | unsupported
+                )
+                blocked_idx = np.flatnonzero(blocked)
+                if len(blocked_idx):
+                    error = probe_rows[blocked_idx, 7] - np.asarray(conservative)[blocked_idx]
+                    keep = blocked_idx[np.argsort(error)[-min(16, len(blocked_idx)):]]
+                    mined_parts.append(probe_rows[keep])
+                    false_blocked += len(keep)
+                continue
+            generated += 1
+            dense = self._densify_joint_path(path)
+            clearance = checker.clearance_batch(dense)
+            bad = np.asarray(clearance) < 0.02
+            if np.any(bad):
+                colliding += 1
+                take = bad.copy()
+                take[:-1] |= bad[1:]
+                take[1:] |= bad[:-1]
+                qn = np.asarray([self.kinematics.normalize(row) for row in dense[take]], dtype=np.float32)
+                mined_parts.append(self._exact_state_rows(checker, qn, SampleSource.TRAJECTORY))
+        if mined_parts:
+            mined = np.concatenate(mined_parts, axis=0)
+            self.field_model.add_rows(mined)
+        else:
+            mined = np.zeros((0, 17), dtype=np.float32)
+        return {
+            "attempted": requested,
+            "generated": generated,
+            "rejected": rejected,
+            "colliding": colliding,
+            "false_blocked": false_blocked,
+            "added_states": len(mined),
+        }
+
+    def _run_balanced_certification(
+        self, checker: UR5PointCloudCollisionChecker
+    ) -> CertificationMetrics:
+        cert_t0 = time.perf_counter()
+        fresh_parts: list[np.ndarray] = []
+        low_count = 0
+        batch_index = 0
+        while low_count < 1000 and batch_index < 4:
+            qn = scrambled_sobol_states(
+                self.online_certification_state_count,
+                seed=32452843 + self.training_update_count + batch_index,
+            )
+            part = self._exact_state_rows(checker, qn, SampleSource.COVERAGE)
+            fresh_parts.append(part)
+            low_count += int(np.count_nonzero(part[:, 7] <= 0.20))
+            batch_index += 1
+        audit_heldout = np.concatenate(fresh_parts, axis=0)
+        replay = self.field_model.state_replay.valid_rows()
+
+        # Uniform 6-D Sobol states are appropriate for the low-clearance audit,
+        # but almost never provide enough fully observed free endpoints for a
+        # route test. Build a separate held-out endpoint set by perturbing
+        # independently labelled free replay states. Exact relabelling keeps
+        # this held-out while ensuring the endpoints remain within supported
+        # portions of the current scene map.
+        route_free_parts: list[np.ndarray] = []
+        replay_free = replay[(replay[:, 7] >= 0.50) & (replay[:, 14] < 0.5)] if len(replay) else replay
+        route_target = max(400, 4 * int(self.online_certification_route_count))
+        endpoint_rng = np.random.default_rng(86028121 + self.training_update_count)
+        for _ in range(12):
+            if len(replay_free) < 2 or sum(len(part) for part in route_free_parts) >= route_target:
+                break
+            count = min(2048, max(512, route_target - sum(len(part) for part in route_free_parts)))
+            seed_idx = endpoint_rng.choice(len(replay_free), size=count, replace=len(replay_free) < count)
+            perturb = endpoint_rng.normal(0.0, 0.01, size=(count, 6)).astype(np.float32)
+            candidate_qn = np.clip(replay_free[seed_idx, :6] + perturb, -0.5, 0.5)
+            labelled = self._exact_state_rows(checker, candidate_qn, SampleSource.COVERAGE)
+            route_free = labelled[(labelled[:, 7] >= 0.50) & (labelled[:, 14] < 0.5)]
+            if len(route_free):
+                route_free_parts.append(route_free)
+        route_free_states = (
+            np.concatenate(route_free_parts, axis=0)[:route_target]
+            if route_free_parts else np.zeros((0, 17), dtype=np.float32)
+        )
+        heldout = (
+            np.concatenate((audit_heldout, route_free_states), axis=0)
+            if len(route_free_states) else audit_heldout
+        )
+        if len(replay):
+            tree = cKDTree(replay[:, :6])
+            coverage_distance, _ = tree.query(heldout[:, :6], k=1)
+        else:
+            coverage_distance = np.full(len(heldout), np.inf, dtype=np.float32)
+        self.field_model.calibrate_state_geometry(
+            heldout[:, :6], heldout[:, 7], heldout[:, 6], coverage_distance
+        )
+        raw, unsafe_probability, conservative = self.field_model.predict_normalized_state_geometry(heldout[:, :6])
+        del raw
+        low = heldout[:, 7] <= 0.20
+        false_free = low & (conservative >= 0.20) & (unsafe_probability < 0.10)
+        shell = heldout[:, 7] <= 0.50
+        free_band = ~shell
+        shell_radius = derive_coverage_radius(
+            coverage_distance[shell], false_free[shell], min_states=50
+        ) if np.any(shell) else 0.0
+        free_radius = derive_coverage_radius(
+            coverage_distance[free_band], false_free[free_band], min_states=50
+        ) if np.any(free_band) else 0.0
+        self.field_model.set_coverage_support(replay[:, :6], shell_radius, free_radius)
+
+        free_states = route_free_states
+        route_requested = self.online_certification_route_count
+        route_attempts = 0
+        accepted = reached = collision_free = 0
+        direct_times: list[float] = []
+        planning_times: list[float] = []
+        rng = np.random.default_rng(49979687 + self.training_update_count)
+        region_codes = self._state_region_codes(free_states)
+        if len(free_states) >= 2 and shell_radius > 0.0 and free_radius > 0.0:
+            for route_index in range(route_requested):
+                pair = self._region_pair_indices(rng, region_codes, cross_region=bool(route_index % 2))
+                if pair is None:
+                    continue
+                route_attempts += 1
+                qa = self.kinematics.denormalize(free_states[pair[0], :6])
+                qb = self.kinematics.denormalize(free_states[pair[1], :6])
+                t0 = time.perf_counter()
+                self.planner.learned_edge_min_speed(qa, qb, qb, max_step_rad=0.04)
+                direct_times.append((time.perf_counter() - t0) * 1.0e3)
+                t0 = time.perf_counter()
+                path = self.planner.plan_learned_speed_search(
+                    qa, qb, step_size_q=self.step_size_q, max_steps=min(self.rollout_max_steps, 120),
+                    min_predicted_speed=0.20, max_local_candidates=self.field_local_rollout_candidates,
+                    allow_direct_edge=True, mode="bidirectional", time_budget_ms=80.0,
+                )
+                planning_times.append((time.perf_counter() - t0) * 1.0e3)
+                if np.asarray(path).ndim != 2 or len(path) < 2:
+                    continue
+                accepted += 1
+                if np.max(np.abs(np.asarray(path[-1]) - qb)) <= 0.04:
+                    reached += 1
+                dense = self._densify_joint_path(path)
+                if np.all(checker.clearance_batch(dense) >= 0.02):
+                    collision_free += 1
+        metrics = CertificationMetrics(
+            low_clearance_states=int(np.count_nonzero(low)),
+            low_clearance_false_free_rate=float(np.mean(false_free[low])) if np.any(low) else 1.0,
+            route_attempts=route_attempts,
+            route_acceptance_rate=float(accepted) / float(max(1, route_attempts)),
+            accepted_goal_reach_rate=float(reached) / float(max(1, accepted)),
+            accepted_collision_free_rate=float(collision_free) / float(max(1, accepted)),
+            scene_version_match=(self.field_model.state_replay.current_map_version == self.voxel_map.map_version),
+            direct_edge_median_ms=float(np.median(direct_times)) if direct_times else float("inf"),
+            planning_p95_ms=float(np.quantile(planning_times, 0.95)) if planning_times else float("inf"),
+            route_requested=int(route_requested),
+            route_free_states=int(len(free_states)),
+        )
+        self.last_certification_metrics = metrics
+        self.field_model.certification_passed = metrics.passed
+        self.get_logger().info(
+            "Balanced certification: "
+            f"passed={metrics.passed} low_false_free={metrics.low_clearance_false_free_rate:.3f} "
+            f"low_states={metrics.low_clearance_states} acceptance={metrics.route_acceptance_rate:.3f} "
+            f"routes={metrics.route_attempts}/{metrics.route_requested} free_endpoints={metrics.route_free_states} "
+            f"reach={metrics.accepted_goal_reach_rate:.3f} collision_free={metrics.accepted_collision_free_rate:.3f} "
+            f"shell_radius={shell_radius:.4f} free_radius={free_radius:.4f} "
+            f"direct_median_ms={metrics.direct_edge_median_ms:.1f} plan_p95_ms={metrics.planning_p95_ms:.1f} "
+            f"cert_ms={(time.perf_counter() - cert_t0) * 1.0e3:.1f}"
+        )
+        return metrics
+
     def _adaptive_training_ready(self) -> bool:
         if not self.adaptive_training_enabled:
             return False
-        if not self.field_diag_gate_enabled:
+        if not self.state_readiness_gate_enabled:
             return bool(
                 self.field_model.total_epochs_trained >= self.field_eval_min_train_steps
                 and self.field_model.replay_size >= self.field_eval_min_replay_pairs
                 and float(self.last_field_eval.get("success_ratio", 0.0)) >= self.field_eval_success_ratio_threshold
             )
-        ok, _reason = self._field_diagnostics_gate_passed()
+        ok, _reason = self._state_readiness_gate_passed()
         return bool(ok)
 
     def _active_training_schedule(self) -> tuple[int, int, int, int, int, bool]:
@@ -2542,10 +3336,10 @@ class ArmMNTFieldsExplorer(Node):
                 f"threshold={self.roi_coverage_threshold:.3f}"
             )
             return
-        diag_ok, diag_reason = self._field_diagnostics_gate_passed()
+        diag_ok, diag_reason = self._state_readiness_gate_passed()
         if not diag_ok:
             self.get_logger().info(
-                "ROI coverage is ready but deferring finish until field diagnostics improve: "
+                "ROI coverage is ready but deferring finish until state-head readiness improves: "
                 f"{diag_reason}"
             )
             return
@@ -2605,10 +3399,10 @@ class ArmMNTFieldsExplorer(Node):
             return
         if self.field_model.replay_size < self.field_eval_min_replay_pairs:
             return
-        diag_ok, diag_reason = self._field_diagnostics_gate_passed()
+        diag_ok, diag_reason = self._state_readiness_gate_passed()
         if not diag_ok:
             self.get_logger().info(
-                "Field-eval finish is ready but diagnostics have not passed yet: "
+                "Field-eval finish is ready but state-head readiness has not passed yet: "
                 f"{diag_reason}"
             )
             return
@@ -3114,7 +3908,12 @@ class ArmMNTFieldsExplorer(Node):
             )
             try:
                 plan_t0 = time.perf_counter()
-                if self.execution_planner == "field":
+                # The field is intentionally untrained during the mapping-only
+                # bootstrap. Use the exact geometric planner for NBV motion;
+                # learned-only execution begins only after training and
+                # certification, never to acquire its own training map.
+                planner_mode = "rrt_connect" if not self.mapping_frozen else self.execution_planner
+                if planner_mode == "field":
                     if self.collision_aware_field_rollout:
                         self.last_plan = self.planner.plan_collision_aware(
                             checker,
@@ -3131,7 +3930,7 @@ class ArmMNTFieldsExplorer(Node):
                             self.current_joints, goal.q_goal, self.step_size_q, self.rollout_max_steps
                         )
                         planner_name = "field"
-                elif self.execution_planner in ("field_then_rrt", "field_rrt", "field_fallback"):
+                elif planner_mode in ("field_then_rrt", "field_rrt", "field_fallback"):
                     planner_name = "rrt_connect"
                     self.last_plan = None
                     if self.field_model.total_epochs_trained > 0:
@@ -3332,6 +4131,15 @@ class ArmMNTFieldsExplorer(Node):
             merged = merged[-self.hard_failed_anchor_buffer_limit :]
         self.hard_failed_anchor_qs = merged.astype(np.float64, copy=False)
 
+    def _append_hard_failed_anchors(self, anchors: np.ndarray) -> None:
+        values = np.asarray(anchors, dtype=np.float64).reshape(-1, 6)
+        if len(values) == 0:
+            return
+        merged = values if len(self.hard_failed_anchor_qs) == 0 else np.vstack((self.hard_failed_anchor_qs, values))
+        if len(merged) > self.hard_failed_anchor_buffer_limit:
+            merged = merged[-self.hard_failed_anchor_buffer_limit :]
+        self.hard_failed_anchor_qs = merged.astype(np.float64, copy=False)
+
     def _hard_failed_training_rows(
         self,
         checker: UR5PointCloudCollisionChecker,
@@ -3412,7 +4220,10 @@ class ArmMNTFieldsExplorer(Node):
 
     def _merge_sampler_stats(self, stats_list: list[dict[str, float]]) -> dict[str, float]:
         if not stats_list:
-            return {}
+            # Focused recovery deliberately disables fresh pair sampling and
+            # trains only from relabelled/mined replay states.  Keep the
+            # sampler diagnostics well-defined for that valid empty cycle.
+            return self._empty_aux_sampler_stats("none")
         out: dict[str, float] = {}
         sum_keys = {
             "attempts", "ik_seed_tries", "accepted_pairs", "refined_q0", "refined_q1", "anchor_seed_tries", "anchor_seed_success",
@@ -3885,6 +4696,24 @@ class ArmMNTFieldsExplorer(Node):
             "replay_capacity": int(self.field_model.replay_capacity),
             "train_minibatch_size": int(self.field_model.minibatch_size),
             "effective_train_batch_size": int(self.field_model.effective_minibatch_size),
+            "map_version": int(self.voxel_map.map_version),
+            "mapping_frozen": bool(self.mapping_frozen),
+            "scene_signature": self.voxel_map.scene_signature(),
+            "online_phase": self.online_budget.phase(),
+            "online_elapsed_s": self.online_budget.elapsed(),
+            "sample_source_counts": self.field_model.state_replay.source_counts(valid_only=True),
+            "stale_replay_states": int(len(self.field_model.state_replay.stale_rows())),
+            "last_active_mining": dict(self.last_active_mining),
+            "coverage": {
+                "states": int(len(self.field_model.coverage_states)),
+                "shell_radius": float(self.field_model.shell_coverage_radius),
+                "free_radius": float(self.field_model.free_coverage_radius),
+            },
+            "certification_passed": bool(self.field_model.certification_passed),
+            "certification_metrics": (
+                None if self.last_certification_metrics is None
+                else self.last_certification_metrics.__dict__
+            ),
             "field_diagnostics_update_count": int(self.training_update_count),
             "field_diagnostics": dict(self.field_model.last_diagnostics),
             "field_eval": {
@@ -3900,8 +4729,11 @@ class ArmMNTFieldsExplorer(Node):
 def main():
     rclpy.init()
     node = ArmMNTFieldsExplorer()
+    executor = MultiThreadedExecutor(num_threads=2)
     try:
-        rclpy.spin(node)
+        rclpy.spin(node, executor=executor)
     finally:
+        executor.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()

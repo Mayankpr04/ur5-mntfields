@@ -12,7 +12,7 @@ arm_mntfields_explorer:
                      0.0, 1.0, 0.0, 0.0,
                      0.0, 0.0, 1.0, 0.0,
                      0.0, 0.0, 0.0, 1.0]
-    voxel_size_m: 0.05
+    voxel_size_m: 0.02
     frontier_match_radius_m: 0.18
     frontier_visit_radius_m: 0.20
     max_frontier_failures: 4
@@ -33,7 +33,7 @@ arm_mntfields_explorer:
     clearance_label_power: 1.0
     train_epochs_per_step: 5
     train_every_n_frames: 1
-    replay_buffer_capacity: 100000
+    replay_buffer_capacity: 300000
     train_minibatch_size: 2000
     train_replay_ratio: 0.75
     replay_recombine_pairs_per_step: 1500
@@ -43,6 +43,8 @@ arm_mntfields_explorer:
     field_ready_train_every_n_frames: 6
     field_ready_replay_recombine_pairs_per_step: 500
     field_ready_hard_failed_pairs_per_step: 256
+    online_map_freeze_s: 90.0
+    online_map_freeze_min_coverage: 0.90
     path_centered_pair_fraction: 0.15
     near_boundary_pair_fraction: 0.40
     path_anchor_stride: 4
@@ -66,8 +68,8 @@ arm_mntfields_explorer:
     field_diagnostics_save_joint_slices: false
     # Default to the paper's Eq. 12. Auxiliary losses are opt-in because the
     # direct speed MSE is unbounded when an initial time gradient is near zero.
-    field_td_loss_weight: 0.0
-    field_speed_loss_weight: 1.0
+    field_td_loss_weight: 0.01
+    field_speed_loss_weight: 0.01
     field_direct_speed_loss_weight: 0.0
     field_normal_loss_weight: 0.0
     field_normal_cos_loss_weight: 0.0
@@ -76,12 +78,11 @@ arm_mntfields_explorer:
     field_low_speed_pred_max: 0.30
     field_low_speed_penalty_weight: 0.0
     field_effective_speed_floor: 0.05
-    field_diag_gate_enabled: true
-    field_diag_gate_min_replay_pairs: 12000
-    field_diag_max_low_overpred_frac: 0.45
-    field_diag_min_speed_corr: 0.35
-    field_diag_min_near_far_gap: 0.20
-    field_diag_min_normal_cos_near: 0.20
+    state_readiness_gate_enabled: true
+    state_readiness_min_replay_states: 12000
+    state_readiness_min_free_states: 256
+    state_readiness_min_free_recall: 0.60
+    state_readiness_max_false_free_rate: 0.02
     replan_while_executing: false
     trajectory_busy_margin_s: 0.25
     trajectory_max_joint_speed: 0.25

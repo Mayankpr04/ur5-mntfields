@@ -36,6 +36,8 @@ setup(
             "view_field_trajectories_3d = ur_mntfields_arm.view_field_trajectories_3d:main",
             "view_planner_score_sweep_3d = ur_mntfields_arm.view_planner_score_sweep_3d:main",
             "view_goal_candidate_sweep_3d = ur_mntfields_arm.view_goal_candidate_sweep_3d:main",
+            "view_offline_planner_benchmark_3d = ur_mntfields_arm.view_offline_planner_benchmark_3d:main",
+            "offline_planner_benchmark = ur_mntfields_arm.offline_planner_benchmark:main",
         ],
     },
 )
